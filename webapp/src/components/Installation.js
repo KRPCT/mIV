@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import { assetPath } from '../assetPath';
 
 const Installation = () => {
   const videoContainerRef = useRef(null);
@@ -8,7 +9,7 @@ const Installation = () => {
       if (!container) return;
 
       const videoUrl = 'm4_website_2.mp4';
-      const videoPath = `/m4/videos/${videoUrl}`;
+      const videoPath = assetPath(`videos/${videoUrl}`);
       const video = document.createElement('video');
       video.controls = true;
       video.autoplay = true;
@@ -28,7 +29,6 @@ const Installation = () => {
       video.onerror = () => {
         container.innerHTML = `
           <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #000; display: flex; align-items: center; justify-content: center; color: white; font-size: 18px; flex-direction: column; gap: 16px;">
-              <div style="font-size: 48px;">🎥</div>
               <div>Video not found: ${videoUrl}</div>
               <div style="font-size: 14px; opacity: 0.7;">Place videos in <code>public/videos</code></div>
           </div>

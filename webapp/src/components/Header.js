@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { assetPath } from '../assetPath';
 
 const Header = () => {
   const [stars, setStars] = useState(3);
@@ -51,7 +52,7 @@ const Header = () => {
               padding: 0
             }}
           >
-            <img src={process.env.PUBLIC_URL + '/m4_logo_transparent.png'} alt="M4" style={{ height: '100px', width: 'auto', marginTop: '15px' }} />
+            <img src={assetPath('m4_logo_transparent.png')} alt="M4" style={{ height: '100px', width: 'auto', marginTop: '15px' }} />
           </button>
         </div>
         <ul className="nav-links">
@@ -76,7 +77,7 @@ const Header = () => {
           >
             <span className="star-count">
               <img
-                src="/m4/pypi_logo.svg"
+                src={assetPath('pypi_logo.svg')}
                 alt="PyPI"
                 style={{ height: '20px', verticalAlign: 'middle', marginRight: '8px' }}
               />
@@ -84,7 +85,7 @@ const Header = () => {
             </span>
           </a>
           <a href="https://github.com/rafiattrach/m4" target="_blank" rel="noopener noreferrer" className="btn-github">
-            <span className="star-count">{stars.toLocaleString()} ⭐</span> Star on GitHub
+            <span className="star-count">{stars.toLocaleString()}</span> Star on GitHub
           </a>
 
         </div>

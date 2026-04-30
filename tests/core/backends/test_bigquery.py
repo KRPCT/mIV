@@ -801,6 +801,17 @@ class TestBigQueryTableInfoGaps:
         assert result.success is False
         assert "Invalid qualified table name" in result.error
 
+    def test_get_table_info_rejects_malicious_backtick_name(self, test_dataset):
+        """Backtick-wrapped names are validated before query construction."""
+        backend = BigQueryBackend()
+
+        result = backend.get_table_info(
+            "`project.dataset.table' OR '1'='1`", test_dataset
+        )
+
+        assert result.success is False
+        assert "Invalid qualified table name" in result.error
+
 
 class TestBigQuerySampleDataGaps:
     """Test get_sample_data edge cases and missing code paths."""
@@ -889,6 +900,17 @@ class TestBigQuerySampleDataGaps:
             backend.get_sample_data("`project.dataset.table`", test_dataset)
 
             assert "`project.dataset.table`" in captured_sql[0]
+
+    def test_backtick_wrapped_malicious_name_rejected(self, test_dataset):
+        """Malicious BigQuery names are rejected before sample SQL is built."""
+        backend = BigQueryBackend()
+
+        result = backend.get_sample_data(
+            "`project.dataset.table; DROP TABLE patients`", test_dataset
+        )
+
+        assert result.success is False
+        assert "Invalid qualified table name" in result.error
 
     def test_legacy_3part_name(self, test_dataset):
         """Test 3-part dotted name is wrapped in backticks."""

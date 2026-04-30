@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { assetPath } from '../assetPath';
 
 const Hero = () => {
   const [isCopied, setIsCopied] = useState(false);
@@ -56,7 +57,7 @@ const Hero = () => {
                     </div>
                     <div className="dashboard-image-container">
                       <img
-                        src="/m4/banner1.png"
+                        src={assetPath('banner1.png')}
                         alt="m4 MIMIC Dashboard"
                         className="dashboard-banner"
                       />

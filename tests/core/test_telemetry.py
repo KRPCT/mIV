@@ -184,6 +184,9 @@ class TestTerminalSession:
     def test_terminal_session_present(self, mock_dataset):
         record = _capture_record(mock_dataset)
         session = record["terminal_session"]
+        if not hasattr(os, "getsid"):
+            assert session is None
+            return
         assert session is not None
         assert session.isdigit()
 
@@ -193,7 +196,9 @@ class TestTerminalSession:
         assert r1["terminal_session"] == r2["terminal_session"]
 
     def test_terminal_session_none_without_getsid(self, mock_dataset):
-        with patch("m4.core.telemetry.os.getsid", side_effect=AttributeError):
+        with patch(
+            "m4.core.telemetry.os.getsid", side_effect=AttributeError, create=True
+        ):
             record = _capture_record(mock_dataset)
         assert record["terminal_session"] is None
 

@@ -14,6 +14,11 @@ from m4.core.backends.base import (
     sanitize_error_message,
 )
 from m4.core.datasets import DatasetDefinition
+from m4.core.validation import (
+    parse_backtick_bigquery_table_name,
+    validate_bigquery_table_parts,
+    validate_table_name,
+)
 
 
 class BigQueryBackend:
@@ -233,6 +238,9 @@ class BigQueryBackend:
         reverse_mapping = {v: k for k, v in dataset.bigquery_schema_mapping.items()}
 
         for dataset_id in dataset.bigquery_dataset_ids:
+            if not validate_bigquery_table_parts(project_id, dataset_id, "_table"):
+                continue
+
             query = f"""
             SELECT table_name
             FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES`
@@ -272,9 +280,8 @@ class BigQueryBackend:
             # Qualified name - parse components
             if has_backticks:
                 # Backtick-wrapped BQ format: `project.dataset.table`
-                clean_name = table_name.strip("`")
-                parts = clean_name.split(".")
-                if len(parts) != 3:
+                parsed_name = parse_backtick_bigquery_table_name(table_name)
+                if parsed_name is None:
                     return QueryResult(
                         dataframe=None,
                         error=(
@@ -282,11 +289,16 @@ class BigQueryBackend:
                             "Expected format: `project.dataset.table`"
                         ),
                     )
-                project_id, dataset_id, simple_name = parts
+                project_id, dataset_id, simple_name = parsed_name
             else:
                 parts = table_name.split(".")
                 if len(parts) == 2:
                     # Canonical format: schema.table
+                    if not validate_table_name(table_name):
+                        return QueryResult(
+                            dataframe=None,
+                            error=f"Invalid table name: {table_name}",
+                        )
                     canonical_schema, simple_name = parts
                     project_id = self._get_project_id(dataset)
                     dataset_id = dataset.bigquery_schema_mapping.get(
@@ -304,6 +316,15 @@ class BigQueryBackend:
                             "`project.dataset.table`"
                         ),
                     )
+
+            if not validate_bigquery_table_parts(project_id, dataset_id, simple_name):
+                return QueryResult(
+                    dataframe=None,
+                    error=(
+                        f"Invalid qualified table name: {table_name}. "
+                        "Expected format: `project.dataset.table`"
+                    ),
+                )
 
             query = f"""
             SELECT column_name, data_type, is_nullable
@@ -330,7 +351,16 @@ class BigQueryBackend:
 
         project_id = self._get_project_id(dataset)
 
+        if not validate_table_name(table_name):
+            return QueryResult(
+                dataframe=None,
+                error=f"Invalid table name: {table_name}",
+            )
+
         for dataset_id in dataset.bigquery_dataset_ids:
+            if not validate_bigquery_table_parts(project_id, dataset_id, table_name):
+                continue
+
             query = f"""
             SELECT column_name, data_type, is_nullable
             FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
@@ -373,20 +403,55 @@ class BigQueryBackend:
         if has_backticks or has_dot:
             if has_backticks:
                 # Backtick-wrapped BQ format
-                clean_name = table_name.strip("`")
-                full_name = f"`{clean_name}`"
+                parsed_name = parse_backtick_bigquery_table_name(table_name)
+                if parsed_name is None:
+                    return QueryResult(
+                        dataframe=None,
+                        error=(
+                            f"Invalid qualified table name: {table_name}. "
+                            "Expected format: `project.dataset.table`"
+                        ),
+                    )
+                project_id, dataset_id, simple_name = parsed_name
+                full_name = f"`{project_id}.{dataset_id}.{simple_name}`"
             else:
                 parts = table_name.split(".")
                 if len(parts) == 2:
                     # Canonical format: schema.table
+                    if not validate_table_name(table_name):
+                        return QueryResult(
+                            dataframe=None,
+                            error=f"Invalid table name: {table_name}",
+                        )
                     canonical_schema, simple_name = parts
                     project_id = self._get_project_id(dataset)
                     bq_dataset_id = dataset.bigquery_schema_mapping.get(
                         canonical_schema, canonical_schema
                     )
+                    if not validate_bigquery_table_parts(
+                        project_id, bq_dataset_id, simple_name
+                    ):
+                        return QueryResult(
+                            dataframe=None,
+                            error=(
+                                f"Invalid qualified table name: {table_name}. "
+                                "Expected format: `project.dataset.table`"
+                            ),
+                        )
                     full_name = f"`{project_id}.{bq_dataset_id}.{simple_name}`"
                 elif len(parts) == 3:
                     # Legacy 3-part: project.dataset.table
+                    project_id, dataset_id, simple_name = parts
+                    if not validate_bigquery_table_parts(
+                        project_id, dataset_id, simple_name
+                    ):
+                        return QueryResult(
+                            dataframe=None,
+                            error=(
+                                f"Invalid qualified table name: {table_name}. "
+                                "Expected format: `project.dataset.table`"
+                            ),
+                        )
                     full_name = f"`{'.'.join(parts)}`"
                 else:
                     return QueryResult(
@@ -414,7 +479,16 @@ class BigQueryBackend:
 
         project_id = self._get_project_id(dataset)
 
+        if not validate_table_name(table_name):
+            return QueryResult(
+                dataframe=None,
+                error=f"Invalid table name: {table_name}",
+            )
+
         for dataset_id in dataset.bigquery_dataset_ids:
+            if not validate_bigquery_table_parts(project_id, dataset_id, table_name):
+                continue
+
             full_name = f"`{project_id}.{dataset_id}.{table_name}`"
             query = f"SELECT * FROM {full_name} LIMIT {limit}"
 

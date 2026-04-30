@@ -1,4 +1,5 @@
 import React from 'react';
+import { assetPath } from '../assetPath';
 
 const ArchitectureDiagram = () => {
   return (
@@ -11,7 +12,7 @@ const ArchitectureDiagram = () => {
 
         <div className="architecture-diagram fade-in">
           <img
-            src="/m4/m4_architecture.png"
+            src={assetPath('m4_architecture.png')}
             alt="m4 Architecture Diagram"
             style={{
               width: '80%',

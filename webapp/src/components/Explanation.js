@@ -1,5 +1,6 @@
 import React from 'react';
 import ArchitectureDiagram from './ArchitectureDiagram';
+import { assetPath } from '../assetPath';
 
 const Explanation = () => {
   return (
@@ -23,7 +24,7 @@ const Explanation = () => {
             </ul>
           </div>
           <div className="screenshot-container">
-            <img src="/m4/banner2.png" alt="Dashboard Overview" />
+            <img src={assetPath('banner2.png')} alt="Dashboard Overview" />
           </div>
         </div>
 
@@ -42,7 +43,7 @@ const Explanation = () => {
             </ul>
           </div>
           <div className="screenshot-container">
-            <img src="/m4/banner3.png" alt="Advanced Data Visualization" />
+            <img src={assetPath('banner3.png')} alt="Advanced Data Visualization" />
           </div>
         </div>
       </div>

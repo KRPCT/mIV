@@ -376,10 +376,29 @@ class TestValidateTableName:
         """Trailing dot (schema.) is invalid."""
         assert validate_table_name("schema.") is False
 
-    def test_backtick_wrapped_passthrough(self):
-        """Backtick-wrapped BigQuery names pass through."""
+    def test_backtick_wrapped_bigquery_name(self):
+        """Backtick-wrapped BigQuery names are valid when each part is safe."""
         assert validate_table_name("`project.dataset.table`") is True
         assert validate_table_name("`physionet-data.mimiciv_hosp.admissions`") is True
+
+    def test_backtick_wrapped_bigquery_name_rejects_injection(self):
+        """Backtick-wrapped BigQuery names must not bypass identifier checks."""
+        blocked_names = [
+            "`project.dataset.table' OR '1'='1`",
+            "`project.dataset.table; DROP TABLE patients`",
+            "`project.dataset.table--comment`",
+            "`project.dataset.table/*comment*/`",
+            "`project.dataset.table with space`",
+            "`project.dataset.table.extra`",
+            "`project.dataset`",
+            "`project..table`",
+            "`project.dataset.`",
+        ]
+
+        for name in blocked_names:
+            assert validate_table_name(name) is False, (
+                f"Unsafe BigQuery name should be rejected: {name}"
+            )
 
     def test_empty_and_none(self):
         """Empty string and None are invalid."""

@@ -9,6 +9,21 @@ import re
 
 import sqlparse
 
+IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+BIGQUERY_PROJECT_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$")
+SQL_KEYWORDS = {
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "DROP",
+    "CREATE",
+    "ALTER",
+    "TRUNCATE",
+}
+
 
 def is_safe_query(sql_query: str) -> tuple[bool, str]:
     """Validate SQL query for injection attacks and dangerous operations.
@@ -148,9 +163,8 @@ def validate_table_name(table_name: str) -> bool:
     if not table_name or not isinstance(table_name, str):
         return False
 
-    # Backtick-wrapped BigQuery names pass through without further checks
-    if table_name.startswith("`") and table_name.endswith("`"):
-        return True
+    if "`" in table_name:
+        return validate_backtick_bigquery_table_name(table_name)
 
     # Split on dot — allow 1 part (table) or 2 parts (schema.table)
     parts = table_name.split(".")
@@ -158,29 +172,77 @@ def validate_table_name(table_name: str) -> bool:
         return False
 
     # Each part must be a valid identifier
-    identifier_re = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
     for part in parts:
-        if not identifier_re.match(part):
+        if not IDENTIFIER_RE.match(part):
             return False
 
     # Block SQL keywords in the table part only (last element)
-    sql_keywords = {
-        "SELECT",
-        "FROM",
-        "WHERE",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "DROP",
-        "CREATE",
-        "ALTER",
-        "TRUNCATE",
-    }
     table_part = parts[-1]
-    if table_part.upper() in sql_keywords:
+    if table_part.upper() in SQL_KEYWORDS:
         return False
 
     return True
+
+
+def validate_bigquery_table_parts(
+    project_id: str,
+    dataset_id: str,
+    table_name: str,
+) -> bool:
+    """Validate BigQuery table identifier components.
+
+    BigQuery references are interpolated into metadata and sample queries.
+    Keep this whitelist-based so quoted names cannot smuggle SQL syntax into
+    generated queries.
+    """
+    if not all(
+        isinstance(part, str) and part for part in (project_id, dataset_id, table_name)
+    ):
+        return False
+
+    if not BIGQUERY_PROJECT_RE.match(project_id):
+        return False
+    if not IDENTIFIER_RE.match(dataset_id):
+        return False
+    if not IDENTIFIER_RE.match(table_name):
+        return False
+    if table_name.upper() in SQL_KEYWORDS:
+        return False
+
+    return True
+
+
+def parse_backtick_bigquery_table_name(
+    table_name: str,
+) -> tuple[str, str, str] | None:
+    """Parse a strict ``project.dataset.table`` BigQuery table name.
+
+    Returns the three identifier parts when valid. Returns ``None`` for any
+    malformed or unsafe input.
+    """
+    if not isinstance(table_name, str):
+        return None
+    if not table_name.startswith("`") or not table_name.endswith("`"):
+        return None
+
+    clean_name = table_name[1:-1]
+    if "`" in clean_name:
+        return None
+
+    parts = clean_name.split(".")
+    if len(parts) != 3:
+        return None
+
+    project_id, dataset_id, simple_name = parts
+    if not validate_bigquery_table_parts(project_id, dataset_id, simple_name):
+        return None
+
+    return project_id, dataset_id, simple_name
+
+
+def validate_backtick_bigquery_table_name(table_name: str) -> bool:
+    """Return whether a backtick-wrapped BigQuery table name is safe."""
+    return parse_backtick_bigquery_table_name(table_name) is not None
 
 
 def format_error_with_guidance(

@@ -2,11 +2,10 @@ import React, { useState } from 'react';
 import emailjs from '@emailjs/browser';
 
 const Contact = () => {
-  // EmailJS configuration with your actual credentials
   const EMAILJS_CONFIG = {
-    serviceId: 'm4_contact_service',
-    templateId: 'template_sn5rm19',
-    publicKey: 'aUrTfsE6oJtpIe1ac'
+    serviceId: import.meta.env.VITE_EMAILJS_SERVICE_ID,
+    templateId: import.meta.env.VITE_EMAILJS_TEMPLATE_ID,
+    publicKey: import.meta.env.VITE_EMAILJS_PUBLIC_KEY
   };
 
   const [contactForm, setContactForm] = useState({
@@ -31,6 +30,10 @@ const Contact = () => {
     setSubmitStatus(null);
 
     try {
+      if (!EMAILJS_CONFIG.serviceId || !EMAILJS_CONFIG.templateId || !EMAILJS_CONFIG.publicKey) {
+        throw new Error('email service is not configured');
+      }
+
       // Prepare template parameters
       const templateParams = {
         user_email: contactForm.email,
@@ -247,7 +250,7 @@ const Contact = () => {
             <h2>Let's Connect</h2>
             <p>Need an MCP for your hospital or EHR? Have suggestions? Want to collaborate? We'd love to hear from you!</p>
             <p style={{ fontSize: '16px', color: '#0052ff', fontWeight: '500', marginTop: '8px' }}>
-              ⚡ Our team responds within 24 hours
+              Our team responds within 24 hours
             </p>
           </div>
 
@@ -303,11 +306,11 @@ const Contact = () => {
               >
                 {isSubmitting ? (
                   <>
-                    <span>⏳</span> Sending...
+                    <span>...</span> Sending...
                   </>
                 ) : (
                   <>
-                    <span>📮</span> Send Message
+                    <span>Send</span> Message
                   </>
                 )}
               </button>
@@ -315,13 +318,13 @@ const Contact = () => {
 
             {submitStatus?.type === 'success' && (
               <div className="status-message status-success">
-                ✅ {submitStatus.message}
+                {submitStatus.message}
               </div>
             )}
 
             {submitStatus?.type === 'error' && (
               <div className="status-message status-error">
-                ❌ {submitStatus.message}
+                {submitStatus.message}
               </div>
             )}
           </form>
