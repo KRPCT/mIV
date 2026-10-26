@@ -3,6 +3,7 @@ name: apache-iv-score
 description: Calculate APACHE IV (Acute Physiology and Chronic Health Evaluation IV) score for ICU mortality prediction. Use for severity assessment, hospital mortality prediction, ICU benchmarking, or case-mix adjustment. eICU has pre-computed scores; MIMIC-IV requires custom implementation with diagnosis mapping challenges.
 tier: expert
 category: clinical
+kind: domain
 ---
 
 # APACHE IV Score Calculation
@@ -57,7 +58,7 @@ For pre-computed APACHE IV scores:
 - `eicu_crd.apachepredvar` - Demographics and mapped diagnosis categories
 - `eicu_crd.patient` - Patient outcomes and demographics
 
-See also [references/eicu.md](eicu.md) for pre-computed score usage and related tables.
+Pass `dataset="eicu"` when running these queries through the M4 Python API.
 
 ## Critical Implementation Notes
 
@@ -110,11 +111,12 @@ eICU provides pre-computed APACHE IV/IVa scores:
 SELECT
     patientunitstayid,
     apacheversion,                  -- 'IV' or 'IVa'
-    apachescore,                    -- Acute physiology score
+    acutephysiologyscore,           -- Acute physiology score
+    apachescore,                    -- APACHE score
     predictedhospitalmortality,     -- Predicted mortality (0-1)
     predictediculos,                -- Predicted ICU length of stay
     actualhospitalmortality         -- Actual outcome (ALIVE/EXPIRED)
-FROM eicu_crd.apachePatientResult
+FROM eicu_crd.apachepatientresult
 WHERE apacheversion = 'IVa';
 ```
 
@@ -130,11 +132,12 @@ WITH mortality_data AS (
         a.patientunitstayid,
         a.predictedhospitalmortality,
         CASE WHEN p.hospitaldischargestatus = 'Expired' THEN 1 ELSE 0 END AS died
-    FROM eicu_crd.apachePatientResult a
+    FROM eicu_crd.apachepatientresult a
     JOIN eicu_crd.patient p
         ON a.patientunitstayid = p.patientunitstayid
     WHERE a.apacheversion = 'IVa'
       AND a.predictedhospitalmortality IS NOT NULL
+      AND a.predictedhospitalmortality BETWEEN 0 AND 1
 )
 SELECT
     COUNT(*) AS n_patients,
@@ -152,10 +155,11 @@ WITH apache_data AS (
         a.apachescore,
         a.predictedhospitalmortality,
         CASE WHEN p.hospitaldischargestatus = 'Expired' THEN 1 ELSE 0 END AS died
-    FROM eicu_crd.apachePatientResult a
+    FROM eicu_crd.apachepatientresult a
     JOIN eicu_crd.patient p
         ON a.patientunitstayid = p.patientunitstayid
     WHERE a.apacheversion = 'IVa'
+      AND a.predictedhospitalmortality BETWEEN 0 AND 1
 )
 SELECT
     FLOOR(apachescore / 10) * 10 AS score_decile,

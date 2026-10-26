@@ -3,6 +3,7 @@ name: oasis-score
 description: Calculate OASIS (Oxford Acute Severity of Illness Score) for ICU patients. Use for mortality prediction with fewer variables than APACHE/SAPS, or when lab data is limited.
 tier: validated
 category: clinical
+kind: domain
 ---
 
 # OASIS Score Calculation
@@ -32,7 +33,8 @@ The Oxford Acute Severity of Illness Score (OASIS) is a parsimonious severity sc
 | Mechanical Ventilation | Yes/No | 0 or 9 |
 | Elective Surgery | Yes/No | 0 or 6 |
 
-**Total Range**: 0-67 (theoretical maximum)
+The OASIS total is the sum of the 10 component scores. Report the component
+scores alongside the total so implementation differences are auditable.
 
 ## Pre-computed Table
 

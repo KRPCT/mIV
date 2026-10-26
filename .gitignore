@@ -30,7 +30,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-.python-version
 
 # IDE specific files
 .idea/
@@ -70,6 +69,12 @@ mimic*.duckdb
 config.json
 *config*.json
 
+# Private release sanitization inputs
+.private_redactions*
+.private_sanitize_salt*
+benchmark/release/v1/.private_redactions*
+benchmark/release/v1/.private_sanitize_salt*
+
 # Operating System specific files
 .DS_Store
 Thumbs.db
@@ -88,10 +93,29 @@ m4_data/
 .vitrine/
 
 notes/
+/paper/
+
+# Benchmark data (large, generated)
+benchmark/shared/ground_truth/
+benchmark/agent_db/
+benchmark/results/
+benchmark/human_eval/
+benchmark/paper/
+
+# Scratch markdown at repo root and benchmark root (keep READMEs tracked)
+/*.md
+!README.md
+/benchmark/*.md
+!/benchmark/README.md
+
+# Presentations
+*.pptx
 
 # Agents
-.claude/
 .agents/
+.claude/
+.codex/
+.cursor/
 .research/
 
 # Node.js

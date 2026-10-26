@@ -1,11 +1,14 @@
 import json
 import logging
 import os
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from m4.core.datasets import DatasetRegistry
 from m4.core.exceptions import DatasetError
+from m4.core.raw_files import has_raw_files
 
 APP_NAME = "m4"
 
@@ -19,8 +22,35 @@ logger = logging.getLogger(APP_NAME)
 
 
 # -------------------------------------------------------------------
-# Data directory rooted at project root (two levels up from this file)
+# Runtime context and data directory resolution
 # -------------------------------------------------------------------
+@dataclass(frozen=True)
+class M4Context:
+    """Resolved runtime context for agent and human interfaces."""
+
+    home: Path
+    data_dir: Path
+    dataset: str | None
+    backend: str
+    study_id: str | None
+    session_id: str | None
+    actor: str | None
+    project_id: str | None
+    telemetry_dir: Path
+    path_disclosure: bool = False
+
+    def public_context(self) -> dict[str, str | None]:
+        """Return non-path attribution fields suitable for JSON envelopes."""
+        return {
+            "dataset": self.dataset,
+            "backend": self.backend,
+            "study_id": self.study_id,
+            "session_id": self.session_id,
+            "actor": self.actor,
+            "project_id": self.project_id,
+        }
+
+
 def _find_project_root_from_cwd() -> Path:
     """
     Search upwards from CWD for a valid 'm4_data' directory.
@@ -43,22 +73,14 @@ def _find_project_root_from_cwd() -> Path:
     return cwd
 
 
-def _get_project_root() -> Path:
+def _get_legacy_project_root() -> Path:
     """
-    Determine project root:
-    - Priority 1: M4_DATA_DIR environment variable (use parent of specified data dir)
-    - Priority 2: If cloned repo: use repository root (two levels up from this file)
-    - Priority 3: If pip installed: Search upwards from CWD for existing 'm4_data' directory, or use CWD.
-    """
-    # Check for explicit data directory override
-    env_data_dir = os.getenv("M4_DATA_DIR")
-    if env_data_dir:
-        data_path = Path(env_data_dir).resolve()
-        if data_path.exists():
-            return data_path.parent
-        # If specified but doesn't exist, use its parent anyway (will be created)
-        return data_path.parent
+    Determine the legacy project root used when no explicit data/home path is set.
 
+    - If cloned repo: use repository root (two levels up from this file)
+    - If pip installed: Search upwards from CWD for existing 'm4_data' directory,
+      or use CWD.
+    """
     package_root = Path(__file__).resolve().parents[2]
 
     # Check if we're in a cloned repository (has pyproject.toml at root)
@@ -69,12 +91,73 @@ def _get_project_root() -> Path:
     return _find_project_root_from_cwd()
 
 
+def _looks_like_legacy_data_parent(path: Path) -> bool:
+    """Return True when M4_DATA_DIR appears to be an old parent/root hint."""
+    direct_markers = (
+        "config.json",
+        "databases",
+        "parquet",
+        "datasets",
+        "raw_files",
+    )
+    if any((path / marker).exists() for marker in direct_markers):
+        return False
+    nested = path / "m4_data"
+    return nested.exists() and any(
+        (nested / marker).exists() for marker in direct_markers
+    )
+
+
+def _get_project_root() -> Path:
+    """Compatibility root for callers that still reason in project-root terms."""
+    env_data_dir = os.getenv("M4_DATA_DIR")
+    if env_data_dir:
+        data_path = Path(env_data_dir).expanduser().resolve()
+        if _looks_like_legacy_data_parent(data_path):
+            return data_path
+        return data_path.parent
+
+    env_home = os.getenv("M4_HOME")
+    if env_home:
+        return Path(env_home).expanduser().resolve()
+
+    return _get_legacy_project_root()
+
+
+def _get_project_data_dir() -> Path:
+    """Resolve the exact M4 data directory.
+
+    M4_DATA_DIR now means the data directory itself.  For a compatibility
+    window, values that clearly point at a parent containing m4_data are mapped
+    to that nested directory with a deprecation warning.
+    """
+    env_data_dir = os.getenv("M4_DATA_DIR")
+    if env_data_dir:
+        data_path = Path(env_data_dir).expanduser().resolve()
+        if _looks_like_legacy_data_parent(data_path):
+            warnings.warn(
+                "M4_DATA_DIR should point directly to the M4 data directory. "
+                "Using the nested m4_data directory for compatibility.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return data_path / "m4_data"
+        return data_path
+
+    return _get_project_root() / "m4_data"
+
+
 _PROJECT_ROOT = _get_project_root()
-_PROJECT_DATA_DIR = _PROJECT_ROOT / "m4_data"
+_PROJECT_DATA_DIR = _get_project_data_dir()
+_M4_HOME = (
+    Path(os.environ["M4_HOME"]).expanduser().resolve()
+    if os.getenv("M4_HOME")
+    else _PROJECT_DATA_DIR
+)
 
 _DEFAULT_DATABASES_DIR = _PROJECT_DATA_DIR / "databases"
 _DEFAULT_PARQUET_DIR = _PROJECT_DATA_DIR / "parquet"
-_RUNTIME_CONFIG_PATH = _PROJECT_DATA_DIR / "config.json"
+_RUNTIME_CONFIG_PATH = _M4_HOME / "config.json"
 _CUSTOM_DATASETS_DIR = _PROJECT_DATA_DIR / "datasets"
 
 
@@ -83,9 +166,99 @@ _CUSTOM_DATASETS_DIR = _PROJECT_DATA_DIR / "datasets"
 # --------------------------------------------------
 
 
-def _ensure_custom_datasets_loaded():
+def ensure_custom_datasets_loaded():
     """Ensure custom datasets are loaded from the custom datasets directory."""
     DatasetRegistry.load_custom_datasets(_CUSTOM_DATASETS_DIR)
+
+
+def get_custom_datasets_dir() -> Path:
+    """The folder whose JSON files define custom datasets."""
+    return _CUSTOM_DATASETS_DIR
+
+
+@dataclass(frozen=True)
+class DatasetStorage:
+    """Where M4 keeps the files it makes of a dataset, inside its data directory."""
+
+    data_dir: Path
+    databases_dir: Path
+    raw_root: Path
+    parquet_root: Path
+    db_path: Path | None
+    # Paths that config.json sets for the dataset instead, by kind
+    configured: dict[str, str]
+
+
+def get_dataset_storage(dataset_name: str) -> DatasetStorage:
+    """The default places of `dataset_name`'s files. Creates nothing."""
+    name = dataset_name.lower()
+    ds = DatasetRegistry.get(name)
+    configured: dict[str, str] = {}
+    try:
+        cfg = json.loads(_RUNTIME_CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    if isinstance(cfg, dict):
+        for kind, key in (
+            ("parquet_root", "parquet_roots"),
+            ("db_path", "duckdb_paths"),
+        ):
+            value = (cfg.get(key) or {}).get(name)
+            if isinstance(value, str) and value:
+                configured[kind] = value
+    return DatasetStorage(
+        data_dir=_PROJECT_DATA_DIR,
+        databases_dir=_DEFAULT_DATABASES_DIR,
+        raw_root=_PROJECT_DATA_DIR / "raw_files" / name,
+        parquet_root=_DEFAULT_PARQUET_DIR / name,
+        db_path=(
+            _DEFAULT_DATABASES_DIR / ds.default_duckdb_filename
+            if ds and ds.default_duckdb_filename
+            else None
+        ),
+        configured=configured,
+    )
+
+
+def _ensure_custom_datasets_loaded():
+    """Backward-compatible private wrapper for existing internal callers."""
+    ensure_custom_datasets_loaded()
+
+
+def resolve_runtime_context(
+    *,
+    dataset: str | None = None,
+    backend: str | None = None,
+    path_disclosure: bool | None = None,
+) -> M4Context:
+    """Resolve runtime context for explicit command/client settings."""
+    resolved_dataset = dataset
+
+    resolved_backend = (backend or get_active_backend()).lower()
+    env_home = os.getenv("M4_HOME")
+    home = Path(env_home).expanduser().resolve() if env_home else _M4_HOME
+
+    if path_disclosure is None:
+        path_disclosure = os.getenv("M4_PATH_DISCLOSURE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "paths",
+        }
+
+    return M4Context(
+        home=home,
+        data_dir=_PROJECT_DATA_DIR,
+        dataset=resolved_dataset,
+        backend=resolved_backend,
+        study_id=os.getenv("M4_STUDY_ID"),
+        session_id=os.getenv("M4_SESSION_ID"),
+        actor=os.getenv("M4_ACTOR"),
+        project_id=get_bigquery_project_id(),
+        telemetry_dir=get_telemetry_dir(),
+        path_disclosure=bool(path_disclosure),
+    )
 
 
 def get_default_database_path(dataset_name: str) -> Path | None:
@@ -126,12 +299,13 @@ def get_dataset_parquet_root(dataset_name: str) -> Path | None:
 
 
 # -----------------------------
-# Runtime config (active dataset)
+# Runtime config
 # -----------------------------
 def _ensure_data_dirs():
     _DEFAULT_DATABASES_DIR.mkdir(parents=True, exist_ok=True)
     _DEFAULT_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
     _PROJECT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _RUNTIME_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     _CUSTOM_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -139,7 +313,6 @@ def _get_default_runtime_config() -> dict:
     # We initialize with empty overrides.
     # Paths are derived dynamically from registry unless overridden here.
     return {
-        "active_dataset": None,
         "duckdb_paths": {},  # Map dataset_name -> path
         "parquet_roots": {},  # Map dataset_name -> path
         "bigquery_project_id": None,
@@ -151,7 +324,9 @@ def load_runtime_config() -> dict:
     _ensure_data_dirs()
     if _RUNTIME_CONFIG_PATH.exists():
         try:
-            return json.loads(_RUNTIME_CONFIG_PATH.read_text())
+            cfg = json.loads(_RUNTIME_CONFIG_PATH.read_text())
+            cfg.pop("active_dataset", None)
+            return {**_get_default_runtime_config(), **cfg}
         except Exception:
             logger.warning("Could not parse runtime config; using defaults")
     # defaults
@@ -165,6 +340,10 @@ def save_runtime_config(cfg: dict) -> None:
 
 def _has_parquet_files(path: Path | None) -> bool:
     return bool(path and path.exists() and any(path.rglob("*.parquet")))
+
+
+def _has_raw_files(path: Path | None) -> bool:
+    return bool(path and path.exists() and has_raw_files(path))
 
 
 def detect_available_local_datasets() -> dict[str, dict[str, Any]]:
@@ -188,10 +367,13 @@ def detect_available_local_datasets() -> dict[str, dict[str, Any]]:
 
         db_path_str = cfg.get("duckdb_paths", {}).get(name)
         db_path = Path(db_path_str) if db_path_str else get_default_database_path(name)
+        raw_root = _PROJECT_DATA_DIR / "raw_files" / name
 
         results[name] = {
+            "raw_present": _has_raw_files(raw_root),
             "parquet_present": _has_parquet_files(parquet_root),
             "db_present": bool(db_path and db_path.exists()),
+            "raw_root": str(raw_root),
             "parquet_root": str(parquet_root) if parquet_root else "",
             "db_path": str(db_path) if db_path else "",
         }
@@ -200,50 +382,20 @@ def detect_available_local_datasets() -> dict[str, dict[str, Any]]:
 
 
 def get_active_dataset() -> str:
-    """Get the active dataset name.
-
-    Raises:
-        DatasetError: If no dataset is configured and none can be auto-detected.
-    """
-    # Ensure custom datasets are loaded so they can be found in the registry
-    _ensure_custom_datasets_loaded()
-
-    # Priority 1: Environment variable
-    env_dataset = os.getenv("M4_DATASET")
-    if env_dataset:
-        return env_dataset
-
-    # Priority 2: Config file
-    cfg = load_runtime_config()
-    active = cfg.get("active_dataset")
-
-    # Else, raise an error that no active dataset is configured.
-    if not active:
-        raise DatasetError(
-            "No active dataset configured. Please rerun 'm4 init' to configure a dataset."
-        )
-
-    return active
+    """Deprecated compatibility shim for removed global dataset state."""
+    raise DatasetError(
+        "Global active dataset state has been removed. Pass the dataset explicitly: "
+        "M4Client(dataset='mimic-iv') or execute_query(sql, dataset='mimic-iv')."
+    )
 
 
 def set_active_dataset(choice: str) -> None:
-    """Set the active dataset.
-
-    Args:
-        choice: Dataset name to set as active
-
-    Raises:
-        ValueError: If the dataset is not registered
-    """
-    _ensure_custom_datasets_loaded()
-    valid_names = {ds.name for ds in DatasetRegistry.list_all()}
-
-    if choice not in valid_names:
-        raise ValueError(f"active_dataset must be a registered dataset. Got: {choice}")
-
-    cfg = load_runtime_config()
-    cfg["active_dataset"] = choice
-    save_runtime_config(cfg)
+    """Deprecated compatibility shim for removed global dataset state."""
+    raise DatasetError(
+        f"Cannot set active dataset to '{choice}'. Global active dataset state has "
+        "been removed. Use M4Client(dataset=...) or pass dataset=... to the "
+        "top-level convenience functions."
+    )
 
 
 VALID_BACKENDS = {"duckdb", "bigquery"}
@@ -331,7 +483,12 @@ def set_bigquery_project_id(project_id: str | None) -> None:
 
 def get_telemetry_dir() -> Path:
     """Return the telemetry directory, creating it if needed."""
-    path = _PROJECT_DATA_DIR / "telemetry"
+    env_telemetry_dir = os.getenv("M4_TELEMETRY_DIR")
+    path = (
+        Path(env_telemetry_dir).expanduser().resolve()
+        if env_telemetry_dir
+        else _M4_HOME / "telemetry"
+    )
     path.mkdir(parents=True, exist_ok=True)
     return path
 

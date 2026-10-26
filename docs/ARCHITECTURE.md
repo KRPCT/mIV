@@ -45,7 +45,7 @@ This transforms M4 from "an MCP server that runs SQL" into "infrastructure that 
 │                              │                              │
 │  ┌──────────────────────────────────────────────────┐       │
 │  │           Modality-Based Tool System             │       │
-│  │  (TABULAR, NOTES, future: WAVEFORMS, IMAGING)    │       │
+│  │  (TABULAR, NOTES, IMAGING, future: WAVEFORMS)    │       │
 │  └──────────────────────────────────────────────────┘       │
 │                              │                              │
 │  ┌──────────────────────────────────────────────────┐       │
@@ -76,9 +76,11 @@ AI Client → MCP Protocol → M4 Tools → Backend → Dataset
 For complex analysis: multi-step workflows, statistical computations, survival analysis.
 
 ```python
-from m4 import set_dataset, execute_query
-set_dataset("mimic-iv")
-df = execute_query("SELECT * FROM mimiciv_hosp.patients")  # Returns DataFrame
+from m4 import execute_query
+df = execute_query(
+    "SELECT * FROM mimiciv_hosp.patients",
+    dataset="mimic-iv",
+)  # Returns DataFrame
 ```
 
 **3. Agent Skills (Knowledge)**
@@ -98,7 +100,8 @@ Claude: [Uses sofa-score skill with validated MIT-LCP SQL]
 Datasets contain different data types (modalities):
 - **TABULAR**: Structured tables (labs, demographics, vitals)
 - **NOTES**: Clinical narratives (discharge summaries, radiology reports)
-- Future: **WAVEFORMS**, **IMAGING**
+- **IMAGING**: Image files beside the tables, fetched per cohort (`m4 fetch-images`)
+- Future: **WAVEFORMS**
 
 Tools declare which modalities they require:
 
@@ -110,7 +113,7 @@ class SearchNotesTool:
     required_modalities = frozenset({Modality.NOTES})
 ```
 
-When you switch datasets, M4 automatically shows only compatible tools. Query a tabular dataset? You get SQL tools. Switch to MIMIC-IV-Note? You get notes search tools.
+When a request selects a dataset, M4 checks which tools are compatible with that dataset. Query a tabular dataset? SQL tools are available. Query MIMIC-IV-Note? Notes search tools are available.
 
 ### 2. Backend Abstraction
 
@@ -144,7 +147,7 @@ M4's skills and concept mappings handle these translations, enabling external va
 FastMCP server exposing tools via Model Context Protocol. Thin adapter over core functionality.
 
 **Tools exposed:**
-- Dataset management: `list_datasets`, `set_dataset`
+- Dataset management: `list_datasets`; `set_dataset` remains only as a migration-error helper
 - Tabular: `get_database_schema`, `get_table_info`, `execute_query`
 - Notes: `search_notes`, `get_note`, `list_patient_notes`
 
@@ -154,10 +157,10 @@ Direct programmatic access returning native Python types:
 
 | Function | Returns |
 |----------|---------|
-| `execute_query(sql)` | `pd.DataFrame` |
-| `get_schema()` | `dict` |
-| `get_table_info(table)` | `dict` with DataFrame values |
-| `search_notes(query)` | `dict` with DataFrame values |
+| `execute_query(sql, dataset=...)` | `pd.DataFrame` |
+| `get_schema(dataset=...)` | `dict` |
+| `get_table_info(table, dataset=...)` | `dict` with DataFrame values |
+| `search_notes(query, dataset=...)` | `dict` with DataFrame values |
 
 ### Tool System (`core/tools/`)
 
@@ -173,11 +176,11 @@ class Tool(Protocol):
     def is_compatible(self, dataset) -> bool: ...
 ```
 
-The `ToolSelector` filters tools based on active dataset modalities.
+The `ToolSelector` filters tools based on explicit dataset modalities.
 
 ### Derived Table System (`core/derived/`)
 
-Pre-computed clinical concept tables materialized from vendored SQL. This system provides ~63 derived tables for MIMIC-IV, covering severity scores, sepsis definitions, organ failure staging, medications, measurements, and more.
+Pre-computed clinical concept tables materialized from vendored SQL. This system provides derived tables for MIMIC-IV, covering severity scores, sepsis definitions, organ failure staging, medications, measurements, and more.
 
 **Architecture:**
 
@@ -250,9 +253,7 @@ Implementations handle database-specific details (DuckDB views, BigQuery schemas
 
 ```python
 # Claude Code with M4 skills generates:
-from m4 import set_dataset, execute_query
-
-set_dataset("mimic-iv")
+from m4 import execute_query
 
 # KDIGO AKI staging (validated)
 aki_cohort = execute_query("""
@@ -263,7 +264,7 @@ aki_cohort = execute_query("""
     FROM mimiciv_derived.kdigo_stages k
     JOIN admissions a ON k.hadm_id = a.hadm_id
     WHERE k.aki_stage >= 1
-""")
+""", dataset="mimic-iv")
 
 mortality_rate = aki_cohort['hospital_expire_flag'].mean()
 ```
@@ -276,7 +277,12 @@ mortality_rate = aki_cohort['hospital_expire_flag'].mean()
 | mimic-iv-demo | TABULAR | 100 | Free | No |
 | mimic-iv | TABULAR | 365k | PhysioNet credentialed | Yes (63 tables) |
 | mimic-iv-note | NOTES | 331k notes | PhysioNet credentialed | No |
-| eicu | TABULAR | 200k+ | PhysioNet credentialed | No |
+| mimic-iv-ed-demo | TABULAR | 100 | Free | No |
+| mimic-iv-ed | TABULAR | 425k ED stays | PhysioNet credentialed | No |
+| eicu-demo | TABULAR | 2.5k ICU stays | Free | No |
+| eicu | TABULAR | 200k+ ICU stays | PhysioNet credentialed | No |
+| mimic-iii | TABULAR | 40k+ | PhysioNet credentialed | No |
+| mimic-cxr-jpg | TABULAR, IMAGING | 377k images | PhysioNet credentialed | No |
 
 Custom datasets can be added via JSON definition. See [Custom Datasets](CUSTOM_DATASETS.md).
 
@@ -285,7 +291,7 @@ Custom datasets can be added via JSON definition. See [Custom Datasets](CUSTOM_D
 
 ### Additional Modalities
 - **WAVEFORMS**: ECG, arterial blood pressure waveforms
-- **IMAGING**: Chest X-rays, CT scans
+- **IMAGING** beyond JPG files: DICOM, CT scans
 
 ### Enhanced Clinical Semantics
 - Semantic search over clinical notes (beyond keyword matching)

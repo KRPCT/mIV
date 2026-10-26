@@ -15,7 +15,7 @@ Architecture:
 
 Tool Surface:
     The MCP tool surface is stable - all tools remain registered regardless of
-    the active dataset. Compatibility is enforced per-call via proactive
+    the selected dataset. Compatibility is enforced per-call via proactive
     capability checking before tool invocation.
 """
 
@@ -29,25 +29,15 @@ from fastmcp import FastMCP
 from m4.apps import init_apps
 from m4.apps.cohort_builder import RESOURCE_URI as COHORT_BUILDER_URI
 from m4.apps.cohort_builder import get_ui_html
-from m4.apps.cohort_builder.query_builder import QueryCohortInput
-from m4.apps.cohort_builder.tool import CohortBuilderInput
 from m4.auth import init_oauth2, require_oauth2
+from m4.client import M4Client
 from m4.core.datasets import DatasetRegistry
 from m4.core.exceptions import M4Error
 from m4.core.serialization import serialize_for_mcp
-from m4.core.telemetry import invoke_tracked, set_interface
-from m4.core.tools import ToolRegistry, ToolSelector, init_tools
-from m4.core.tools.management import ListDatasetsInput, SetDatasetInput
-from m4.core.tools.notes import (
-    GetNoteInput,
-    ListPatientNotesInput,
-    SearchNotesInput,
-)
-from m4.core.tools.tabular import (
-    ExecuteQueryInput,
-    GetDatabaseSchemaInput,
-    GetTableInfoInput,
-)
+from m4.core.telemetry import set_interface
+from m4.core.tools import ToolSelector, init_tools
+from m4.core.tools.management import ListDatasetsInput, ListDatasetsTool
+from m4.services.capabilities import build_capabilities_manifest
 
 # Create FastMCP server instance
 mcp = FastMCP("m4")
@@ -61,11 +51,10 @@ set_interface("mcp")
 # Tool selector for capability-based filtering
 _tool_selector = ToolSelector()
 
-# MCP-exposed tool names (for filtering in set_dataset snapshot)
+# MCP-exposed tool names (for capability snapshots)
 _MCP_TOOL_NAMES = frozenset(
     {
         "list_datasets",
-        "set_dataset",
         "get_database_schema",
         "get_table_info",
         "execute_query",
@@ -74,6 +63,7 @@ _MCP_TOOL_NAMES = frozenset(
         "list_patient_notes",
         "cohort_builder",
         "query_cohort",
+        "capabilities",
     }
 )
 
@@ -128,21 +118,23 @@ def _serialize_table_info_result(result: dict[str, Any]) -> str:
 
 def _serialize_datasets_result(result: dict[str, Any]) -> str:
     """Serialize list_datasets result to MCP string."""
-    active = result.get("active_dataset") or "(unset)"
+    selected = result.get("selected_dataset")
     backend = result.get("backend", "duckdb")
     datasets = result.get("datasets", {})
 
     if not datasets:
         return "No datasets detected."
 
-    output = [f"Active dataset: {active}\n"]
+    output = []
+    if selected:
+        output.append(f"Selected dataset: {selected}\n")
     output.append(
         f"Backend: {'local (DuckDB)' if backend == 'duckdb' else 'cloud (BigQuery)'}\n"
     )
 
     for label, info in datasets.items():
-        is_active = " (Active)" if info.get("is_active") else ""
-        output.append(f"=== {label.upper()}{is_active} ===")
+        is_selected = " (Selected)" if info.get("selected") else ""
+        output.append(f"=== {label.upper()}{is_selected} ===")
 
         parquet_icon = "✅" if info.get("parquet_present") else "❌"
         db_icon = "✅" if info.get("db_present") else "❌"
@@ -169,19 +161,6 @@ def _serialize_datasets_result(result: dict[str, Any]) -> str:
         output.append("")
 
     return "\n".join(output)
-
-
-def _serialize_set_dataset_result(result: dict[str, Any]) -> str:
-    """Serialize set_dataset result to MCP string."""
-    dataset_name = result.get("dataset_name", "")
-    warnings = result.get("warnings", [])
-
-    status_msg = f"✅ Active dataset switched to '{dataset_name}'."
-
-    for warning in warnings:
-        status_msg += f"\n⚠️ {warning}"
-
-    return status_msg
 
 
 def _serialize_search_notes_result(result: dict[str, Any]) -> str:
@@ -270,18 +249,34 @@ def _serialize_list_patient_notes_result(result: dict[str, Any]) -> str:
 # ==========================================
 
 
+def _client_for_dataset(dataset: str | None) -> M4Client:
+    resolved = dataset if dataset is not None else DatasetRegistry.get_active()
+    return M4Client(dataset=resolved, interface="mcp")
+
+
+@mcp.resource("m4://capabilities", mime_type="application/json")
+def capabilities_resource() -> str:
+    """Return the M4 capability manifest as JSON."""
+    return json.dumps(build_capabilities_manifest(), indent=2)
+
+
+@mcp.tool()
+def capabilities() -> str:
+    """Return the M4 capability manifest as JSON."""
+    return json.dumps(build_capabilities_manifest(), indent=2)
+
+
 @mcp.tool()
 def list_datasets() -> str:
     """📋 List all available datasets and their status.
 
     Returns:
-        A formatted string listing available datasets, indicating which one is active,
+        A formatted string listing available datasets, indicating selected status,
         and showing availability of local database and BigQuery support.
     """
     try:
-        tool = ToolRegistry.get("list_datasets")
-        dataset = DatasetRegistry.get_active()
-        result = invoke_tracked(tool, dataset, ListDatasetsInput())
+        dummy = DatasetRegistry.list_all()[0]
+        result = ListDatasetsTool().invoke(dummy, ListDatasetsInput(), context=None)
         return _serialize_datasets_result(result)
     except M4Error as e:
         return f"**Error:** {e}"
@@ -289,58 +284,38 @@ def list_datasets() -> str:
 
 @mcp.tool()
 def set_dataset(dataset_name: str) -> str:
-    """🔄 Switch the active dataset.
-
-    Args:
-        dataset_name: The name of the dataset to switch to (e.g., 'mimic-iv-demo').
-
-    Returns:
-        Confirmation message with supported tools snapshot, or error if not found.
-    """
-    try:
-        # Check if target dataset exists before switching
-        target_dataset_def = DatasetRegistry.get(dataset_name.lower())
-
-        tool = ToolRegistry.get("set_dataset")
-        dataset = DatasetRegistry.get_active()
-        result = invoke_tracked(
-            tool, dataset, SetDatasetInput(dataset_name=dataset_name)
-        )
-        output = _serialize_set_dataset_result(result)
-
-        # Append supported tools snapshot if dataset is valid
-        if target_dataset_def is not None:
-            output += _tool_selector.get_supported_tools_snapshot(
-                target_dataset_def, _MCP_TOOL_NAMES
-            )
-
-        return output
-    except M4Error as e:
-        return f"**Error:** {e}"
+    """Deprecated: M4 no longer keeps a global active dataset."""
+    return (
+        "**Error:** set_dataset is no longer supported. M4 tools now require an "
+        "explicit dataset argument, for example dataset='mimic-iv'."
+    )
 
 
 @mcp.tool()
 @require_oauth2
-def get_database_schema() -> str:
+def get_database_schema(dataset: str | None = None) -> str:
     """📚 Discover what data is available in the database.
 
     **When to use:** Start here to understand what tables exist.
+
+    Args:
+        dataset: Dataset name, e.g. 'mimic-iv'.
 
     Returns:
         List of all available tables in the database with current backend info.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         # Proactive capability check
         compat_result = _tool_selector.check_compatibility(
-            "get_database_schema", dataset
+            "get_database_schema", dataset_def
         )
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("get_database_schema")
-        result = invoke_tracked(tool, dataset, GetDatabaseSchemaInput())
+        result = client.schema()
         return _serialize_schema_result(result)
     except M4Error as e:
         return f"**Error:** {e}"
@@ -348,12 +323,15 @@ def get_database_schema() -> str:
 
 @mcp.tool()
 @require_oauth2
-def get_table_info(table_name: str, show_sample: bool = True) -> str:
+def get_table_info(
+    table_name: str, show_sample: bool = True, dataset: str | None = None
+) -> str:
     """🔍 Explore a specific table's structure and see sample data.
 
     **When to use:** After identifying relevant tables from get_database_schema().
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv'.
         table_name: Exact table name (case-sensitive).
         show_sample: Whether to include sample rows (default: True).
 
@@ -361,18 +339,19 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
         Table structure with column names, types, and sample data.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         # Proactive capability check
-        compat_result = _tool_selector.check_compatibility("get_table_info", dataset)
+        compat_result = _tool_selector.check_compatibility(
+            "get_table_info", dataset_def
+        )
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("get_table_info")
-        result = invoke_tracked(
-            tool,
-            dataset,
-            GetTableInfoInput(table_name=table_name, show_sample=show_sample),
+        result = client.table_info(
+            table_name=table_name,
+            show_sample=show_sample,
         )
         return _serialize_table_info_result(result)
     except M4Error as e:
@@ -381,7 +360,7 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
 
 @mcp.tool()
 @require_oauth2
-def execute_query(sql_query: str) -> str:
+def execute_query(sql_query: str, dataset: str | None = None) -> str:
     """🚀 Execute SQL queries to analyze data.
 
     **Recommended workflow:**
@@ -390,21 +369,22 @@ def execute_query(sql_query: str) -> str:
     3. Write your SQL query with exact names
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv'.
         sql_query: Your SQL SELECT query (SELECT only).
 
     Returns:
         Query results or helpful error messages.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         # Proactive capability check
-        compat_result = _tool_selector.check_compatibility("execute_query", dataset)
+        compat_result = _tool_selector.check_compatibility("execute_query", dataset_def)
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("execute_query")
-        result = invoke_tracked(tool, dataset, ExecuteQueryInput(sql_query=sql_query))
+        result = client.query(sql_query)
         # Result is a DataFrame - serialize it
         return serialize_for_mcp(result)
     except M4Error as e:
@@ -423,6 +403,7 @@ def search_notes(
     note_type: str = "all",
     limit: int = 5,
     snippet_length: int = 300,
+    dataset: str | None = None,
 ) -> str:
     """🔍 Search clinical notes by keyword.
 
@@ -432,6 +413,7 @@ def search_notes(
     **Note types:** 'discharge' (summaries), 'radiology' (reports), or 'all'
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv-note'.
         query: Search term to find in notes.
         note_type: Type of notes to search ('discharge', 'radiology', or 'all').
         limit: Maximum number of results per note type (default: 5).
@@ -441,22 +423,18 @@ def search_notes(
         Matching snippets with note IDs for follow-up retrieval.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
-        compat_result = _tool_selector.check_compatibility("search_notes", dataset)
+        compat_result = _tool_selector.check_compatibility("search_notes", dataset_def)
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("search_notes")
-        result = invoke_tracked(
-            tool,
-            dataset,
-            SearchNotesInput(
-                query=query,
-                note_type=note_type,
-                limit=limit,
-                snippet_length=snippet_length,
-            ),
+        result = client.search_notes(
+            query=query,
+            note_type=note_type,
+            limit=limit,
+            snippet_length=snippet_length,
         )
         return _serialize_search_notes_result(result)
     except M4Error as e:
@@ -465,7 +443,9 @@ def search_notes(
 
 @mcp.tool()
 @require_oauth2
-def get_note(note_id: str, max_length: int | None = None) -> str:
+def get_note(
+    note_id: str, max_length: int | None = None, dataset: str | None = None
+) -> str:
     """📄 Retrieve full text of a specific clinical note.
 
     **Warning:** Clinical notes can be very long. Consider using
@@ -473,6 +453,7 @@ def get_note(note_id: str, max_length: int | None = None) -> str:
     to truncate output.
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv-note'.
         note_id: The note ID (e.g., from search_notes or list_patient_notes).
         max_length: Optional maximum characters to return (truncates if exceeded).
 
@@ -480,17 +461,16 @@ def get_note(note_id: str, max_length: int | None = None) -> str:
         Full note text, or truncated version if max_length specified.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
-        compat_result = _tool_selector.check_compatibility("get_note", dataset)
+        compat_result = _tool_selector.check_compatibility("get_note", dataset_def)
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("get_note")
-        result = invoke_tracked(
-            tool,
-            dataset,
-            GetNoteInput(note_id=note_id, max_length=max_length),
+        result = client.get_note(
+            note_id=note_id,
+            max_length=max_length,
         )
         return _serialize_get_note_result(result)
     except M4Error as e:
@@ -503,6 +483,7 @@ def list_patient_notes(
     subject_id: int,
     note_type: str = "all",
     limit: int = 20,
+    dataset: str | None = None,
 ) -> str:
     """📋 List available clinical notes for a patient.
 
@@ -513,6 +494,7 @@ def list_patient_notes(
     use it here to find related clinical notes.
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv-note'.
         subject_id: Patient identifier (same as in MIMIC-IV).
         note_type: Type of notes to list ('discharge', 'radiology', or 'all').
         limit: Maximum notes to return (default: 20).
@@ -521,23 +503,19 @@ def list_patient_notes(
         List of available notes with metadata for the patient.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         compat_result = _tool_selector.check_compatibility(
-            "list_patient_notes", dataset
+            "list_patient_notes", dataset_def
         )
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("list_patient_notes")
-        result = invoke_tracked(
-            tool,
-            dataset,
-            ListPatientNotesInput(
-                subject_id=subject_id,
-                note_type=note_type,
-                limit=limit,
-            ),
+        result = client.list_patient_notes(
+            subject_id=subject_id,
+            note_type=note_type,
+            limit=limit,
         )
         return _serialize_list_patient_notes_result(result)
     except M4Error as e:
@@ -555,9 +533,9 @@ def cohort_builder_ui() -> str:
     return get_ui_html()
 
 
-@mcp.tool()
+@mcp.tool(meta={"ui": {"resourceUri": COHORT_BUILDER_URI}})
 @require_oauth2
-def cohort_builder() -> str:
+def cohort_builder(dataset: str | None = None) -> str:
     """Launch the interactive cohort builder.
 
     Opens a visual interface for filtering patients by demographics and
@@ -571,15 +549,17 @@ def cohort_builder() -> str:
         interactive cohort builder interface.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         # Proactive capability check
-        compat_result = _tool_selector.check_compatibility("cohort_builder", dataset)
+        compat_result = _tool_selector.check_compatibility(
+            "cohort_builder", dataset_def
+        )
         if not compat_result.compatible:
             return compat_result.error_message
 
-        tool = ToolRegistry.get("cohort_builder")
-        result = invoke_tracked(tool, dataset, CohortBuilderInput())
+        result = client.cohort_builder()
         return serialize_for_mcp(result)
     except M4Error as e:
         return f"**Error:** {e}"
@@ -595,6 +575,7 @@ def query_cohort(
     icd_match_all: bool | None = None,
     has_icu_stay: bool | None = None,
     in_hospital_mortality: bool | None = None,
+    dataset: str | None = None,
 ) -> str:
     """Query cohort counts based on filtering criteria.
 
@@ -602,6 +583,7 @@ def query_cohort(
     Can also be called directly to get cohort statistics.
 
     Args:
+        dataset: Dataset name, e.g. 'mimic-iv'.
         age_min: Minimum patient age (0-130, inclusive).
         age_max: Maximum patient age (0-130, inclusive).
         gender: Patient gender ('M' or 'F').
@@ -614,67 +596,29 @@ def query_cohort(
         JSON with patient_count, admission_count, demographics, and SQL.
     """
     try:
-        dataset = DatasetRegistry.get_active()
+        client = _client_for_dataset(dataset)
+        dataset_def = client.dataset
 
         # Proactive capability check
-        compat_result = _tool_selector.check_compatibility("query_cohort", dataset)
+        compat_result = _tool_selector.check_compatibility("query_cohort", dataset_def)
         if not compat_result.compatible:
             # Return JSON error for UI compatibility
             return json.dumps({"error": compat_result.error_message})
 
-        tool = ToolRegistry.get("query_cohort")
-        result = invoke_tracked(
-            tool,
-            dataset,
-            QueryCohortInput(
-                age_min=age_min,
-                age_max=age_max,
-                gender=gender,
-                icd_codes=icd_codes,
-                icd_match_all=icd_match_all,
-                has_icu_stay=has_icu_stay,
-                in_hospital_mortality=in_hospital_mortality,
-            ),
+        result = client.query_cohort(
+            age_min=age_min,
+            age_max=age_max,
+            gender=gender,
+            icd_codes=icd_codes,
+            icd_match_all=icd_match_all,
+            has_icu_stay=has_icu_stay,
+            in_hospital_mortality=in_hospital_mortality,
         )
         # Return JSON directly for MCP App UI compatibility
         return json.dumps(result)
     except M4Error as e:
         # Return JSON error for UI compatibility
         return json.dumps({"error": str(e)})
-
-
-# ==========================================
-# _meta.ui.resourceUri INJECTION
-# ==========================================
-
-
-def _inject_cohort_builder_meta() -> None:
-    """Inject _meta.ui.resourceUri into the cohort_builder tool.
-
-    FastMCP doesn't expose _meta via the decorator, so we monkey-patch
-    the tool's to_mcp_tool method to include it.
-    """
-    try:
-        tool_manager = mcp._tool_manager
-        tool_obj = tool_manager._tools.get("cohort_builder")
-        if tool_obj is None:
-            return
-
-        original_to_mcp = tool_obj.to_mcp_tool
-
-        def patched_to_mcp(**overrides: Any) -> Any:
-            overrides.setdefault("_meta", {"ui": {"resourceUri": COHORT_BUILDER_URI}})
-            return original_to_mcp(**overrides)
-
-        # Bypass Pydantic's __setattr__ validation
-        object.__setattr__(tool_obj, "to_mcp_tool", patched_to_mcp)
-    except (AttributeError, TypeError):
-        # FastMCP internals may change; fail silently
-        pass
-
-
-# Apply the _meta injection
-_inject_cohort_builder_meta()
 
 
 def main():

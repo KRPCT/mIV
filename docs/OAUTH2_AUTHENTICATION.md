@@ -32,7 +32,10 @@ For manual MCP client configuration with OAuth2 enabled:
 }
 ```
 
-> **Note:** The active backend is configured via `m4 backend duckdb` (or `bigquery`), not through MCP env vars.
+> **Note:** For normal use, configure the active backend with `m4 backend duckdb`
+> or `m4 backend bigquery`. Use `M4_BACKEND` in MCP env blocks only when that
+> server process should override saved backend configuration. Datasets are
+> selected per tool call.
 
 ## Environment Variables
 

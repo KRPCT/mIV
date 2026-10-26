@@ -8,7 +8,7 @@ For the canonical list of bundled skills, see `src/m4/skills/SKILLS_INDEX.md`.
 
 Without skills, an AI assistant might guess at APIs or make assumptions about clinical concepts. With M4 skills installed:
 
-- **m4-api**: Claude knows to call `set_dataset()` before queries, returns proper DataFrames, handles errors correctly
+- **m4-api**: Claude knows to pass `dataset=...` or use `M4Client(dataset=...)`, returns proper DataFrames, handles errors correctly
 - **Clinical skills**: Claude understands SOFA scoring, Sepsis-3 criteria, KDIGO AKI staging, and other validated clinical concepts
 
 Skills activate automatically when relevant. Ask Claude to "calculate SOFA scores for my cohort" and it will use the validated SQL from MIT-LCP without you needing to look up the implementation.
@@ -50,6 +50,43 @@ Filters combine with AND logic: `--tier validated --category clinical` installs 
 
 Skills are installed to `.claude/skills/` (or equivalent for other tools). AI assistants automatically discover skills in these locations.
 
+## Managed Catalog Integration
+
+Applications that consume M4 skills without modifying a user's project can use the
+versioned JSON contract:
+
+```bash
+m4 skills catalog --json
+m4 skills materialize --target /absolute/managed/path --json
+```
+
+These managed catalog commands are available in `m4-infra` 0.5.4 and later.
+
+`catalog` reports schema version `1`, the M4 package version, a deterministic bundle
+digest, and a descriptor for every packaged skill and asset. Paths in this manifest
+are relative to the packaged skill root.
+
+`materialize` copies the complete bundle into the explicit target, verifies every
+declared file digest, writes `.m4-skills-manifest.json`, and atomically publishes the
+target. It never installs into `.claude`, `.codex`, or another provider directory.
+An existing verified target with the same digest is reused; any other existing
+target is left untouched and reported as an error. Target paths containing
+symlinks or, on Windows, directory junctions are rejected, except in the user's
+home folder and the folders above it, where the account may come with them;
+the result's `target` is then the folder they lead to. That home folder is the one
+the system records for the account, not `HOME` or `USERPROFILE`, which whoever
+starts M4 can set. Other reparse points, such as OneDrive placeholders, are not
+links and are allowed. Publication fails closed if the platform cannot provide an
+atomic no-replace directory rename.
+
+Compatibility policy:
+
+- consumers must reject unsupported `schemaVersion` values;
+- additive fields may be introduced within schema version `1`;
+- incompatible changes require a new schema version;
+- `packageVersion` plus `bundleDigest` identifies a reproducible bundle;
+- individual `contentDigest` and `treeDigest` values identify exact skill content.
+
 
 ## Available Skills
 
@@ -57,8 +94,10 @@ Skills are installed to `.claude/skills/` (or equivalent for other tools). AI as
 
 | Skill | Triggers On | Description |
 |-------|-------------|-------------|
-| **m4-api** | "M4 API", "query MIMIC with Python", "clinical data analysis" | Complete Python API usage including `set_dataset()`, DataFrame handling, error handling |
-| **m4-research** | "research workflow", "clinical study", "protocol" | Structured clinical research workflow and protocol drafting |
+| **m4-api** | "M4 API", "query MIMIC with Python", "clinical data analysis" | Complete Python API usage including explicit dataset selection, DataFrame handling, error handling |
+| **clinical-research-session** | "research workflow", "clinical study", "protocol" | Run a study with the researcher from question to results: interview, protocol, scripts, cards |
+| **m4-setup** | "M4 setup", "fix M4", "dataset missing", "skills missing", "vitrine broken" | Diagnose and repair M4 environment, dataset, skill installation, backend, and vitrine issues |
+| **vitrine-api** | "show results", "the card", "the board", "forms", "approval" | Publish cards to the researcher's board and read back cards, decisions, and annotations |
 | **create-m4-skill** | "create skill", "new skill", "skill template" | Guide for creating new M4 skills |
 
 ### Severity Scores
@@ -153,6 +192,7 @@ name: sofa-score
 description: Calculate SOFA score for ICU patients...
 tier: validated
 category: clinical
+kind: domain
 ---
 
 # SOFA Score Calculation
@@ -160,7 +200,7 @@ category: clinical
 [Detailed instructions, SQL examples, clinical context...]
 ```
 
-The frontmatter has four required fields: `name`, `description`, `tier` (one of `validated`, `expert`, `community`), and `category` (`clinical` or `system`). See `src/m4/skills/SKILL_FORMAT.md` for full details.
+The frontmatter has four required fields: `name`, `description`, `tier` (one of `validated`, `expert`, `community`), and `category` (`clinical` or `system`). `kind` is optional and classifies how catalog consumers should group the skill. See `src/m4/skills/SKILL_FORMAT.md` for full details.
 
 Clinical skills include validated SQL scripts in their `scripts/` subdirectory.
 
@@ -175,6 +215,7 @@ name: cardiac-surgery-cohort
 description: Identify cardiac surgery patients. Triggers on "CABG", "valve replacement", "cardiac surgery"
 tier: community
 category: clinical
+kind: domain
 ---
 
 # Cardiac Surgery Cohort Selection
@@ -188,15 +229,14 @@ When identifying cardiac surgery patients in MIMIC-IV:
 ## Standard Query
 
 \`\`\`python
-from m4 import set_dataset, execute_query
+from m4 import execute_query
 
-set_dataset("mimic-iv")
 cardiac_cohort = execute_query("""
     SELECT DISTINCT p.subject_id, p.hadm_id
     FROM procedures_icd p
     WHERE p.icd_code LIKE '02%'
       AND p.icd_version = 10
-""")
+""", dataset="mimic-iv")
 \`\`\`
 ```
 

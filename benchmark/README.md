@@ -1,0 +1,436 @@
+# M4Bench
+
+## Camera-Ready Evidence (NeurIPS 2026)
+
+The paper-facing per-run evidence is released as two open packages, hosted at
+<https://huggingface.co/datasets/hannesill/m4bench-evidence> and attached
+to the `m4bench-neurips2026-camera-ready` GitHub release:
+
+| Package | Runs | Size (bytes) | SHA-256 |
+|---|---:|---:|---|
+| `m4bench-evidence-submission.tar.zst` | 1,400 | 7,548,717 | `f8b72940bd98cd9b2a852fa79c416310e2ed8ec7795b181941358d3b03ca708c` |
+| `m4bench-evidence-claude-replication.tar.zst` | 560 | 6,398,244 | `4aeb5eda83090f89e5a3bf5d0e8c4568c18309efd66b496c4655e11abd13471b` |
+
+The submission package holds the submitted campaigns (760 primary Codex,
+190 Claude sentinel, 340 Codex follow-up, 110 exploratory OSS runs); the
+Claude package holds the July 2026 full-coverage replication. Each package
+contains `result.json`, sanitized `trace.jsonl`, `instruction.md`,
+`egress.jsonl` (not for the OSS runs), and an `output_summary.json` in place
+of the row-level `output.csv`, plus `metadata/public_artifact_manifest.json`
+mapping every source hash to its public hash. Row-level agent outputs, tool
+outputs, MIMIC-IV/eICU data, task databases, and reference outputs are not
+included.
+Croissant metadata: `benchmark/release/v1/croissant/m4bench_evidence.croissant.json`.
+Verification and table regeneration:
+[`release/v1/README.md`](release/v1/README.md#camera-ready-release).
+
+Earlier review-phase archives are superseded by these packages and should not
+be used.
+
+Benchmark for evaluating AI agents' ability to derive validated clinical concepts
+from real EHR databases. 15 task families (28 tasks) covering severity scores,
+organ failure staging, comorbidity indices, infection detection, medication data,
+and temporal event classification. Ground truth SQL is adapted from MIT-LCP
+mimic-code with benchmark-specific conventions documented inline, such as
+treating missing component scores as normal when the task instruction requires
+that behavior.
+
+## Design
+
+Each task asks an agent to compute a clinical concept (e.g., SOFA score, KDIGO
+AKI staging, Charlson comorbidity index) from a MIMIC-IV DuckDB database. The
+agent's output CSV is compared column-by-column against ground truth generated
+from validated mimic-code concepts adapted to the benchmark's explicit task
+semantics.
+
+Tasks come in two modes:
+- **standard** — validated target tables are removed, but intermediate feature
+  tables (e.g., `first_day_vitalsign`) are available
+- **raw** — for MIMIC-IV tasks, the entire `mimiciv_derived` schema is removed
+  from the agent database, forcing the agent to rebuild the requested concept
+  from source clinical tables. eICU raw tasks use the source eICU database,
+  which has no comparable derived shortcut schema.
+
+Two primary experimental conditions:
+- **no-skill** — agent receives only the task instruction
+- **with-skill** — a task-specific clinician-reviewed skill is injected
+
+A supplementary condition, **with-skill-all** (all benchmark skills injected),
+probes whether skill discovery works when the agent must find relevant knowledge
+from a larger library. This is a Tier 6 noise probe, not the headline comparison.
+
+**Information gradient**: Task instructions describe the clinical concept
+accurately but are intentionally underspecified on dataset-specific
+implementation details (encoding conventions, sentinel values, item IDs,
+edge-case handling). Skills fill that gap with MIMIC-specific procedural
+knowledge. This creates a measurable difference between what an agent can
+figure out from schema exploration alone versus what it gets from
+clinician-reviewed guidance.
+
+Benchmark skill snapshots are intentionally benchmark-safe: they should not
+include runnable examples that query dropped target concept tables, and they do
+not ship the production SQL scripts. Run `python benchmark/preflight.py` before
+launching a release-grade campaign to check that this separation still holds.
+Release-facing clinical design notes live in `benchmark/task_design_notes/`.
+They document task construction and known conventions for readers, but they
+are never mounted into agent runtimes and are kept outside `benchmark/tasks/`.
+
+A contamination analysis dimension (`--schema`) probes schema memorization by
+running tasks on obfuscated (renamed) and restructured (merged/denormalized)
+versions of MIMIC-IV. These conditions perturb schema and query structure, but
+they preserve clinical values and provide a schema dictionary to the agent, so
+they should not be described as full data-value decontamination.
+
+## Task Families
+
+| Family | Tasks | Category | Key challenge |
+|--------|-------|----------|---------------|
+| SOFA | 2 | Severity score | 6-organ subscore aggregation, vasopressor doses |
+| SIRS | 1 | Severity score | Vital sign thresholds, WBC count (raw-only) |
+| SAPS-II | 2 | Severity score | 15 physiological variables + admission type |
+| APSIII | 2 | Severity score | Worst-from-normal scoring, 16 variables |
+| OASIS | 3 | Severity score | Vitals-only (no labs), pre-ICU LOS, eICU cross-database |
+| GCS | 2 | Neurological | Component extraction, intubated patient handling, eICU cross-database |
+| MELD | 2 | Organ failure | Logarithmic formula, sodium adjustment |
+| KDIGO | 2 | Organ failure | Creatinine + urine output AKI staging |
+| Charlson | 1 | Comorbidity | ICD code mapping with hierarchy rules (raw-only) |
+| Baseline creatinine | 2 | Estimation | Decision tree + ICD lookup + MDRD formula |
+| Ventilation | 2 | Classification | Episode detection, 14h gap rule, device string matching |
+| Suspicion of infection | 2 | Temporal matching | Asymmetric time window (72h before / 24h after) |
+| Sepsis-3 | 1 | Compositional | SOFA ≥ 2 + suspected infection (raw-only, depends on two sub-concepts) |
+| Vasopressor equivalents | 2 | Medication | NE-equivalent dose, unit conversion |
+| Urine output rate | 2 | Data engineering | Rolling windows, LAG functions, weight normalization |
+
+## Structure
+
+```
+benchmark/
+  run.py           # Harness: task setup → agent invocation → evaluation
+  evaluate.py      # Standalone evaluation against ground truth
+  setup.py         # Database and ground truth preparation
+  bench.sh         # Docker wrapper for reproducible execution
+  lib/             # Shared utilities (comparison, test runner, transforms, sandbox)
+  tasks/           # Task definitions (instruction, skills, config) — 15 families
+  ground_truth/    # Ground truth SQL and generated CSVs (gzipped)
+  agent_db/        # Task-specific DuckDB databases (intermediates selectively dropped)
+  results/         # Run outputs (agent traces, CSVs, result JSON)
+```
+
+Task definitions are nested as `tasks/{family}/{task-name}/task.toml`. The
+family level is retained even when a family currently has one task, so
+`--family` selection, task listing, and paper tables use one consistent layout.
+
+## Evaluation Integrity
+
+**Docker via `bench.sh` is the only valid evaluation mode for release-grade
+runs.** `benchmark/matrix.py` now uses `bench.sh` by default for execution, so
+matrix-driven campaigns can be publishable as long as they use a fresh
+`--results-root`. Local execution is still useful for development and anomaly
+investigation, but those runs should not be reported as benchmark evidence.
+
+`bench.sh` runs orchestration and evaluation outside the agent runtime, then
+launches each agent in a minimal Docker container. That container receives only
+the per-run workdir, ephemeral HOME/auth seed, selected source-data mounts, and
+the task database copied into the workdir. It does not mount `benchmark/tasks`,
+`benchmark/ground_truth`, `benchmark/results`, `benchmark/agent_db`, or the
+obfuscation dictionary.
+
+## Execution Plan
+
+The canonical release-facing execution spec lives in this README, and
+`benchmark/matrix.py` contains the current execution plan. The default matrix
+profile is the paper's primary profile (v1.1). The explicit
+`--profile rerun-v1.1` flag is retained as a stable alias for provenance.
+
+For a fresh-machine reproduction workflow covering PhysioNet downloads, `m4 init`
+for MIMIC-IV and eICU, benchmark artifact generation, canary checks, full
+campaign execution, and analysis export, see
+[`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
+
+The table, figure, metadata, and evidence-packaging scripts for the paper live
+under [`release/v1/`](release/v1/). That tree includes the frozen planning
+manifests and generated tables needed to inspect the analysis without the
+manuscript checkout. Set `M4BENCH_PAPER_DIR` only
+when intentionally regenerating tables or figures into a separate paper
+workspace.
+
+Common release path overrides:
+
+```bash
+export M4BENCH_M4_DIR=/path/to/m4
+export M4BENCH_RESULTS_DIR=/path/to/m4/benchmark/results
+export M4BENCH_PAPER_DIR=/path/to/output/workspace
+```
+
+## Verification Quickstart
+
+1. Download the two evidence packages, check their SHA-256 sidecars, and run
+   `verify_public_evidence.py` and `scan_public_evidence.py` on them. The exact
+   commands are in
+   [`release/v1/README.md`](release/v1/README.md#verify-and-regenerate-tables-from-a-clean-checkout).
+   This needs no credentialed data and regenerates the paper's result tables
+   from the packages.
+
+2. Run the source checks from this checkout:
+
+```bash
+uv run python benchmark/preflight.py --skip-db-check
+```
+
+3. With PhysioNet access, rebuild the task databases and reference outputs and
+   run `uv run python benchmark/preflight.py` without the flag. The full path,
+   including downloads and Docker-backed campaign execution, is in
+   [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md). The canonical wrapper is
+   `benchmark/scripts/run_paper_rerun.sh`.
+
+The table generators under `release/v1/scripts/` (`make_final_results.py` and
+others) read the private run roots and exit without writing when those are
+absent. Which code and skill text each campaign ran is recorded in
+[`release/v1/README.md`](release/v1/README.md#code-and-skill-state-by-campaign).
+
+## Licenses & Attribution
+
+- M4Bench code, task definitions, harness, release scripts, and skill snapshots:
+  MIT license under the repository license.
+- Ground-truth SQL and several clinical concept conventions: adapted from
+  MIT-LCP MIMIC-Code / eICU-Code concepts, which are MIT-licensed; task-specific
+  lineage is recorded in `benchmark/tasks/*/PROVENANCE.yaml` and SQL headers.
+- MIMIC-IV v3.1 and eICU-CRD v2.0: credentialed PhysioNet datasets governed by
+  their respective data-use agreements. Source databases and generated task
+  DuckDB files are not redistributed.
+
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the concise
+release-facing notice.
+
+## Usage
+
+```bash
+# Setup (creates agent DB and ground truth for a task)
+python benchmark/setup.py --task mimic-sirs-24h
+python benchmark/setup.py --all
+
+# Preflight before release-grade runs
+python benchmark/preflight.py
+
+# Adversarial isolation canary (Docker-backed; run before release-grade campaigns)
+bash benchmark/bench.sh --leak-canary --agent codex --model gpt-5.4-mini --results-root /benchmark/results/canary-YYYYMMDD
+
+# Run a single task
+python benchmark/run.py --task mimic-sirs-24h --condition with-skill --agent claude
+
+# Run all tasks in a family
+python benchmark/run.py --family sofa --condition no-skill --agent claude
+
+# Run all tasks with multiple seeds
+python benchmark/run.py --all --condition no-skill --agent claude --seeds 3
+
+# Run only raw-mode tasks (e.g., for contamination analysis)
+python benchmark/run.py --all --mode raw --condition no-skill --agent claude
+
+# Run on obfuscated schema (contamination analysis)
+python benchmark/run.py --task mimic-sirs-24h-raw --condition no-skill --schema obfuscated
+
+# Run an operational-spec baseline when the task has operational-spec.md
+python benchmark/run.py --task mimic-oasis-24h --condition operational-spec --agent codex
+
+# Parallel execution
+python benchmark/run.py --all --condition no-skill --agent claude --parallel 4
+
+# Release-grade audited v1.1 matrix campaign (Docker-backed by default)
+python benchmark/matrix.py --tier all --agent codex --results-root benchmark/results/codex-rerun-v1.1
+
+# Resume an interrupted campaign from the same results root
+python benchmark/matrix.py --tier all --agent codex --results-root benchmark/results/codex-rerun-v1.1 --skip-existing
+
+# Equivalent explicit provenance form
+python benchmark/matrix.py --profile rerun-v1.1 --tier all --agent codex --results-root benchmark/results/codex-rerun-v1.1
+
+# Sparse external-provider comparison
+python benchmark/matrix.py --profile provider-comparison --agent claude --results-root benchmark/results/release-20260406-claude-sentinel
+
+# Targeted validity follow-ups: operational-spec sentinel + transformed-schema with-skill
+python benchmark/matrix.py --profile validity-followup --agent codex --results-root benchmark/results/codex-validity-followup
+```
+
+## Evaluation
+
+Reward is the mean per-column match rate (0.0–1.0) over
+`evaluation.value_columns`, not over identifiers or required metadata columns.
+`evaluation.required_columns` is a schema contract only. Per-column tolerances
+are configurable in each task's `task.toml`. Pytest-based assertions provide
+pass/fail diagnostics on row coverage, required columns, and per-criterion
+accuracy.
+
+Ground-truth generation writes deterministic gzipped CSVs plus sidecar
+manifests containing the SQL hash, source DB hash, DuckDB version, row count,
+column list, CSV hash, and sort keys. Preflight validates those manifests so a
+release-grade run fails closed when ground truth is stale or alias-derived files were
+not reproducibly generated.
+
+## Supported Agents
+
+Claude Code, Codex, Gemini CLI, and Pi over Ollama (`pi-ollama`). See
+`AGENT_COMMANDS` in `run.py` for configuration.
+
+For Codex CLI, the harness uses `codex exec` with web search disabled and
+`sandbox_mode="workspace-write"` inside the Docker-backed benchmark container.
+It injects task skills into `.codex/skills/` inside each run workdir.
+Authenticate first with `codex login` for ChatGPT subscription access. As an
+alternative, set `CODEX_API_KEY` or `OPENAI_API_KEY` in `benchmark/.env` or the
+shell environment before launching `bench.sh`.
+
+For Gemini CLI, authenticate first with Gemini CLI's Google login flow. As an
+alternative, set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in `benchmark/.env` or the
+shell environment before launching `bench.sh`.
+
+For `pi-ollama`, the harness invokes Pi in non-interactive mode with the
+Ollama provider and disables user-global discovery features (`--no-context-files`,
+`--no-themes`, `--no-prompt-templates`, `--no-extensions`) so runs are not
+affected by local themes, prompt templates, extensions, or context files. Task
+skills are injected into `.pi/skills/` inside each run workdir. The per-run HOME
+seeds only `.pi/agent/models.json`, which lets Pi find the local Ollama model
+configuration without copying unrelated auth files.
+
+`benchmark/matrix.py` uses agent-specific default model sets:
+- Claude: `opus`, `sonnet`
+- Codex: `gpt-5.5`, `gpt-5.4-mini`
+- Gemini: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`
+- Pi/Ollama: `qwen3:4b`
+
+The default matrix profile is the paper's GPT-primary profile (v1.1):
+run it with `--agent codex`, then use `--profile provider-comparison` for sparse
+Claude or Gemini sentinel runs. `pi-ollama` is the OSS local-model baseline for
+zero-API-cost reproducibility. Provider-comparison runs are supplementary and
+should not be described as powered benchmark-wide estimates.
+
+Targeted validity follow-up profiles are also available. `--profile
+operational-spec` schedules the eight native-schema sentinel tasks under the
+`operational-spec` condition. `--profile schema-skill` schedules targeted
+`with-skill` runs on the obfuscated and restructured MIMIC schemas. `--profile
+validity-followup` combines both tiers. The operational-spec condition expects
+each scheduled task directory to contain `operational-spec.md`; the runner fails
+closed if the file is missing or empty.
+
+Because matrix profiles can allocate different numbers of runs by tier, the
+release analysis uses equal task/cell weighting. Naive run-weighted averages
+are not valid headline effects.
+
+Reasoning policy is pinned by default through `--reasoning-effort auto`: Codex
+and Claude Code run at `medium`, while Gemini CLI and `pi-ollama` are recorded
+as `provider-default` because they do not expose the same named effort scale.
+Pass `--reasoning-effort default` to leave each CLI/provider default untouched,
+or an explicit supported level for Codex/Claude ablations.
+
+For Claude campaigns, authenticate with Claude Code itself. Local debugging uses
+the same host login state as `claude -p`. Docker-backed release-grade runs should first
+log Claude into the benchmark image with the helper:
+
+```bash
+bash benchmark/claude_login_container.sh
+bash benchmark/bench.sh \
+  --task mimic-sirs-24h --condition no-skill --agent claude --model opus
+```
+
+The login helper creates or reuses the persistent `m4bench-claude-login`
+container and stores only allowlisted Claude auth files in the
+`m4bench-claude-auth` Docker volume. Each benchmark agent container mounts that
+volume read-only, copies those files into its ephemeral per-run HOME, and does
+not mount host Claude projects, memories, histories, tasks, ground truth, or
+results. As an alternative to Claude login, set a stable `ANTHROPIC_API_KEY` in
+`benchmark/.env` or the shell environment before launching `bench.sh`. Do not
+use `ANTHROPIC_AUTH_TOKEN`, long-lived token exports, or copied OAuth access
+tokens for Claude benchmark runs.
+
+### Pi/Ollama local setup
+
+`pi-ollama` requires Ollama and at least one local model. The Docker benchmark
+path installs Pi inside the benchmark image, so a host Pi install is needed only
+for the optional local smoke test. A minimal setup uses `qwen3:4b`:
+
+```bash
+which ollama
+
+brew install ollama
+ollama serve
+ollama pull qwen3:4b
+```
+
+For the optional local smoke test outside Docker, install Pi on the host and
+create or update `~/.pi/agent/models.json` with an Ollama provider that uses
+`localhost`:
+
+```bash
+npm install -g @mariozechner/pi-coding-agent
+mkdir -p ~/.pi/agent
+```
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": {
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        { "id": "qwen3:4b" }
+      ]
+    }
+  }
+}
+```
+
+Then confirm Pi can see the model:
+
+```bash
+pi --list-models ollama
+```
+
+Optional local smoke test without MIMIC data:
+
+```bash
+SMOKE_DIR=$(mktemp -d -t m4_pi_smoke)
+cd "$SMOKE_DIR"
+printf "stay_id,score\n1,2\n2,3\n3,5\n4,7\n5,11\n" > input.csv
+
+pi --provider ollama --model qwen3:4b -p \
+  "Read input.csv. For each row, double the score column. Write the result to output.csv with the same columns and row count. Do not include extra columns. Do not print the CSV; write it to disk."
+```
+
+For release-grade Docker runs, host `~/.pi` is optional. `bench.sh` installs Pi
+in the benchmark image, mounts `~/.pi` read-only only when it exists, and the
+harness creates or rewrites the per-run copy of `.pi/agent/models.json` from
+`M4BENCH_OLLAMA_BASE_URL`. By default that URL is
+`http://host.docker.internal:11434/v1`, which points from the container back to
+the host Ollama server. The required fresh-machine setup is therefore: Docker
+running, Ollama running on the host, and the selected model pulled.
+
+Override the host or port when needed:
+
+```bash
+M4BENCH_OLLAMA_HOST=host.docker.internal \
+M4BENCH_OLLAMA_PORT=11434 \
+bash benchmark/bench.sh --task mimic-sirs-24h-raw --condition no-skill \
+  --agent pi-ollama --model qwen3:4b
+```
+
+When `--agent pi-ollama` is used, the Docker network lock allows the configured
+Ollama host and port for the `benchagent` user while continuing to reject other
+non-allowlisted outbound traffic.
+
+## Interrupted Runs
+
+Stop an overnight matrix run with `Ctrl-C`. Any run that already wrote a
+`result.json` under the campaign `--results-root` is complete; an in-flight run
+may be lost and will be scheduled again. Resume with the same command plus
+`--skip-existing`. The skip logic matches task, condition, model, schema,
+reasoning effort, and trial id, so it resumes missing trials without duplicating
+completed seed labels.
+
+Docker-backed runs use one short-lived agent container per task attempt. Claude
+login state persists separately in the `m4bench-claude-login` container and
+`m4bench-claude-auth` Docker volume created by
+`benchmark/claude_login_container.sh`.

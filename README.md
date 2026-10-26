@@ -18,7 +18,7 @@ M4 is infrastructure for AI-assisted clinical research. Initialize MIMIC-IV, eIC
 
 [Usage example – M4 MCP](https://claude.ai/share/93f26832-f298-4d1d-96e3-5608d7f0d7ad) | [Usage example – Code Execution](docs/M4_Code_Execution_Example.pdf)
 
-> M4 builds on the [M3](https://github.com/rafiattrach/m3) project. Please [cite](#citation) their work when using M4!
+> M4 builds on the [M3](https://github.com/rafiattrach/m3) project. Please [cite](#citation) their work as well when using M4!
 
 
 ## Why M4?
@@ -96,12 +96,12 @@ Copy the generated JSON into your client's MCP settings, restart, and start aski
 For complex analysis that goes beyond simple queries, M4 provides a Python API that returns Python data types instead of formatted strings (e.g. pd.DataFrame for SQL queries). This transforms M4 from a query tool into a complete clinical data analysis environment.
 
 ```python
-from m4 import set_dataset, execute_query, get_schema
+from m4 import execute_query, get_schema
 
-set_dataset("mimic-iv")
+dataset = "mimic-iv"
 
 # Get schema as a dict
-schema = get_schema()
+schema = get_schema(dataset=dataset)
 print(schema['tables'])  # ['mimiciv_hosp.admissions', 'mimiciv_hosp.diagnoses_icd', ...]
 
 # Query returns a pandas DataFrame
@@ -111,7 +111,7 @@ df = execute_query("""
     GROUP BY icd_code
     ORDER BY n DESC
     LIMIT 10
-""")
+""", dataset=dataset)
 
 # Use full pandas power: filter, join, compute statistics
 df[df['n'] > 100].plot(kind='bar')
@@ -143,7 +143,7 @@ For the canonical list of bundled skills, see `src/m4/skills/SKILLS_INDEX.md`.
 - **Research Methodology**: Common research pitfalls and how to avoid them
 
 **System skills:**
-- **M4 Framework**: Python API usage, research workflow, skill creation guide
+- **M4 Framework**: Python API usage, research workflow, setup repair, vitrine display, skill creation guide
 - **Data Structure**: MIMIC-IV table relationships, MIMIC-eICU mapping
 
 **Supported tools:** Claude Code, Cursor, Cline, Codex CLI, Gemini CLI, GitHub Copilot
@@ -203,24 +203,63 @@ Once connected, try asking:
 | Dataset | Modality | Size | Access | Local | BigQuery | Derived Tables |
 |---------|----------|------|--------|-------|----------|----------------|
 | **mimic-iv-demo** | Tabular | 100 patients | Free | Yes | No | No |
-| **mimic-iv** | Tabular | 365k patients | [PhysioNet credentialed](https://physionet.org/content/mimiciv/) | Yes | Yes | Yes (63 tables) |
+| **mimic-iv** | Tabular | 365k patients | [PhysioNet credentialed](https://physionet.org/content/mimiciv/) | Yes | Yes | Yes |
 | **mimic-iv-note** | Notes | 331k notes | [PhysioNet credentialed](https://physionet.org/content/mimic-iv-note/) | Yes | Yes | No |
-| **eicu** | Tabular | 200k+ patients | [PhysioNet credentialed](https://physionet.org/content/eicu-crd/) | Yes | Yes | No |
+| **mimic-iv-ed-demo** | Tabular | 100 patients | Free | Yes | Yes | No |
+| **mimic-iv-ed** | Tabular | 425k ED stays | [PhysioNet credentialed](https://physionet.org/content/mimic-iv-ed/) | Yes | Yes | No |
+| **eicu-demo** | Tabular | 2.5k ICU stays | Free | Yes | Yes | No |
+| **eicu** | Tabular | 200k+ ICU stays | [PhysioNet credentialed](https://physionet.org/content/eicu-crd/) | Yes | Yes | No |
+| **mimic-iii** | Tabular | 40k+ patients | [PhysioNet credentialed](https://physionet.org/content/mimiciii/) | Yes | Yes | No |
+| **mimic-cxr-jpg** | Tabular, Imaging | 377k chest X-rays | [PhysioNet credentialed](https://physionet.org/content/mimic-cxr-jpg/) | Yes | No | No |
 
-These datasets are supported out of the box. However, it is possible to add any other custom dataset by following [these instructions](docs/CUSTOM_DATASETS.md).
+MIMIC-CXR-JPG's images are half a terabyte: M4 downloads its tables, and `m4 fetch-images mimic-cxr-jpg --from-csv cohort.csv` fetches the images of a cohort (paths from `mimic_cxr.images.image_path`).
 
-Switch datasets or backends anytime:
+These datasets are supported out of the box. A folder of your own CSV files becomes a dataset with `m4 define-dataset NAME --src DIR` and `m4 init NAME --src DIR`; other datasets can be added by following [these instructions](docs/CUSTOM_DATASETS.md).
+
+Choose datasets explicitly at each call site and switch the saved backend anytime:
 ```bash
-m4 use mimic-iv     # Switch to full MIMIC-IV
 m4 backend bigquery # Switch to BigQuery (or duckdb)
-m4 status           # Show active dataset and backend
+m4 capabilities     # Show available interfaces, datasets, tools, and policies
+m4 doctor           # Diagnose local, BigQuery, and MCP setup
+m4 status --dataset mimic-iv # Show dataset and backend status
 m4 status --all     # List all available datasets
-m4 status --derived # Show per-table derived materialization status
+m4 status --dataset mimic-iv --derived # Show per-table derived materialization status
 ```
+
+For automation and external agents, M4 also provides non-interactive JSON
+commands that use request-scoped dataset and backend options:
+
+```bash
+m4 agent-env --dataset mimic-iv --backend duckdb --json
+m4 capabilities --json
+m4 doctor --json
+m4 download mimic-iv --json
+m4 list-datasets --json --no-interactive
+m4 schema --dataset mimic-iv --backend duckdb --json --no-interactive
+m4 describe-table mimiciv_hosp.patients --dataset mimic-iv --json --no-interactive
+m4 query --dataset mimic-iv --sql "SELECT COUNT(*) AS n FROM mimiciv_hosp.patients" --json --no-interactive
+m4 provenance export --json
+```
+
+Machine-facing status and backend metadata hide local filesystem paths by
+default. Use `--paths` or `M4_PATH_DISCLOSURE=1` only when the caller is allowed
+to see raw local paths.
+
+Long-running dataset setup can emit newline-delimited JSON progress events:
+
+```bash
+m4 init mimic-iv --json --events ndjson --no-interactive --download \
+  --physionet-credentials-file /path/to/physionet-credentials.json
+m4 init-derived mimic-iv --json --events ndjson
+```
+
+When `--events ndjson` is used, stdout is an NDJSON stream instead of a single
+JSON object. The final result is emitted as `operation_completed.result`; setup
+failures are emitted as `operation_failed.error`.
 
 **Derived concept tables** (MIMIC-IV only):
 ```bash
-m4 init-derived mimic-iv         # Materialize ~63 derived tables (SOFA, sepsis3, KDIGO, etc.)
+m4 init-derived mimic-iv         # Materialize derived tables (SOFA, sepsis3, KDIGO, etc.)
 m4 init-derived mimic-iv --list  # List available derived tables without materializing
 ```
 
@@ -231,21 +270,47 @@ After running `m4 init mimic-iv`, you are prompted whether to materialize derive
 
 1. **Get PhysioNet credentials:** Complete the [credentialing process](https://physionet.org/settings/credentialing/) and sign the data use agreement for the dataset.
 
-2. **Download the data:**
+2. **Download the data with M4:**
+   ```bash
+   cat > physionet-credentials.json <<'JSON'
+   {
+     "username": "YOUR_USERNAME",
+     "password": "YOUR_PASSWORD"
+   }
+   JSON
+
+   m4 init mimic-iv --download --physionet-credentials-file physionet-credentials.json
+   ```
+
+   Do not pass PhysioNet passwords as command-line flags. Use a scoped
+   credentials file with restrictive permissions and delete it after setup.
+
+   M4 implements the same recursive, resumable pattern PhysioNet documents for
+   `wget -r -N -c -np` against `/files/...` dataset URLs, while preserving the
+   expected raw layout under `m4_data/raw_files/<dataset>/`.
+
+   You can still download manually if needed:
+   ```bash
+   m4 download mimic-iv
+   ```
+
+   For credentialed datasets, `m4 download` validates the expected local layout
+   and prints a dataset-specific resumable `wget` command.
+
    ```bash
    # For MIMIC-IV
-   wget -r -N -c -np --cut-dirs=2 -nH --user YOUR_USERNAME --ask-password \
+   wget -r -N -c -np --cut-dirs=3 -nH --user YOUR_USERNAME --ask-password \
      https://physionet.org/files/mimiciv/3.1/ \
      -P m4_data/raw_files/mimic-iv
 
    # For eICU
-   wget -r -N -c -np --cut-dirs=2 -nH --user YOUR_USERNAME --ask-password \
+   wget -r -N -c -np --cut-dirs=3 -nH --user YOUR_USERNAME --ask-password \
      https://physionet.org/files/eicu-crd/2.0/ \
      -P m4_data/raw_files/eicu
    ```
-   The `--cut-dirs=2 -nH` flags ensure CSV files land directly in `m4_data/raw_files/mimic-iv/` rather than a nested `physionet.org/files/...` structure.
+   The `--cut-dirs=3 -nH` flags remove the PhysioNet `files/<dataset>/<version>/` prefix so CSV files land under `m4_data/raw_files/<dataset>/` with only dataset-internal folders preserved.
 
-3. **Initialize:**
+3. **Initialize after a manual download:**
    ```bash
    m4 init mimic-iv   # or: m4 init eicu
    ```
@@ -256,15 +321,15 @@ This converts the CSV files to Parquet format and creates a local DuckDB databas
 
 ## Available Tools
 
-M4 exposes these tools to your AI client. Tools are filtered based on the active dataset's modality.
+M4 exposes these tools to your AI client. Data tools are checked against the explicit dataset selected for that call.
 
 **Dataset Management:**
 | Tool | Description |
 |------|-------------|
 | `list_datasets` | List available datasets and their status |
-| `set_dataset` | Switch the active dataset |
+| `set_dataset` | Removed migration aid; pass `dataset` to data tools |
 
-**Tabular Data Tools** (mimic-iv, mimic-iv-demo, eicu):
+**Tabular Data Tools** (every dataset except mimic-iv-note):
 | Tool | Description |
 |------|-------------|
 | `get_database_schema` | List all available tables |
@@ -279,6 +344,14 @@ M4 exposes these tools to your AI client. Tools are filtered based on the active
 | `list_patient_notes` | List notes for a patient (metadata only) |
 
 
+## M4Bench
+
+M4Bench is the benchmark built on M4: 28 clinical EHR derivation tasks on MIMIC-IV and eICU that measure how well coding agents reproduce reference clinical concepts, with and without skills.
+
+- Benchmark, harness, and evaluator: [`benchmark/`](benchmark/README.md)
+- Per-run evidence for the paper (sanitized results and traces for 1,960 runs): [hannesill/m4bench-evidence](https://huggingface.co/datasets/hannesill/m4bench-evidence) on Hugging Face
+- Paper release and verification steps: [`benchmark/release/v1/`](benchmark/release/v1/README.md), tag `m4bench-neurips2026-camera-ready`
+
 ## More Documentation
 
 | Guide | Description |
@@ -289,7 +362,8 @@ M4 exposes these tools to your AI client. Tools are filtered based on the active
 | [Skills](docs/SKILLS.md) | Clinical and system skills for AI-assisted research |
 | [Tools Reference](docs/TOOLS.md) | MCP tool documentation |
 | [BigQuery Setup](docs/BIGQUERY.md) | Google Cloud for full datasets |
-| [Custom Datasets](docs/CUSTOM_DATASETS.md) | Add your own PhysioNet datasets |
+| [Custom Datasets](docs/CUSTOM_DATASETS.md) | Add your own data or other PhysioNet datasets |
+| [M4Bench Reproducibility](benchmark/REPRODUCIBILITY.md) | MIMIC-IV/eICU initialization and benchmark reruns |
 | [Development](docs/DEVELOPMENT.md) | Contributing, testing, code style |
 | [OAuth2 Authentication](docs/OAUTH2_AUTHENTICATION.md) | Enterprise security setup |
 
@@ -318,6 +392,9 @@ M4 is infrastructure for AI-assisted clinical research. Current priorities:
 m4 init mimic-iv-demo --force
 ```
 
+**`m4 status` shows a dataset as incomplete:**
+An initialization was interrupted, a raw file came into M4's raw folder after it finished, or the dataset was initialized by M4 0.5.5 or earlier, which did not record that it finished. Run `m4 init <dataset>` again: with the same `--src` to go on with a run that read from another folder, without it to convert what is in M4's own raw folder. Only what is missing is redone, and a download that did not finish is completed first.
+
 **MCP client won't connect:**
 Check client logs (Claude Desktop: Help → View Logs) and ensure the config JSON is valid.
 
@@ -332,7 +409,18 @@ m4 config --quick          # Regenerate generic config
 
 ## Citation
 
-M4 builds on the M3 project. Please cite:
+If you use M4 or M4Bench, please cite the M4Bench paper:
+
+```bibtex
+@inproceedings{ill2026m4bench,
+  title={M4Bench: Evaluating Procedural Specification for Clinical EHR Derivation Agents},
+  author={Ill, Hannes and Al Attrach, Rafi and Fani, Rajna and Han, Ahram and Yamamoto, Ryohei and Moerig, Marlene Louisa and Yoon, Dukyong and Celi, Leo Anthony},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS), Evaluations and Datasets Track},
+  year={2026}
+}
+```
+
+M4 builds on the [M3](https://github.com/rafiattrach/m3) project. Please also cite M3 when using this repository:
 
 ```bibtex
 @article{attrach2025conversational,

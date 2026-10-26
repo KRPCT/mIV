@@ -45,7 +45,8 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0", # Additional JWT support with crypto
     "httpx>=0.24.0", # Modern HTTP client for OAuth2 token validation
     "duckdb>=1.4.1",
-    "vitrine>=0.1.0",
+    "vitrine>=0.1.5",
+    "tomli>=2.0.0; python_version < '3.11'", # TOML parser for Python 3.10
 ]
 
 [project.optional-dependencies]
@@ -73,11 +74,11 @@ m4-mcp-server = "m4.mcp_server:main"  # Kept for backwards compatibility
 vitrine = "vitrine.cli:app"  # Standalone vitrine CLI (from vitrine package)
 
 [project.urls]
-Homepage = "https://github.com/rafiattrach/m4"
-Repository = "https://github.com/rafiattrach/m4"
-Documentation = "https://github.com/rafiattrach/m4#readme"
-Issues = "https://github.com/rafiattrach/m4/issues"
-Changelog = "https://github.com/rafiattrach/m4/releases"
+Homepage = "https://github.com/hannesill/m4"
+Repository = "https://github.com/hannesill/m4"
+Documentation = "https://github.com/hannesill/m4#readme"
+Issues = "https://github.com/hannesill/m4/issues"
+Changelog = "https://github.com/hannesill/m4/releases"
 
 [tool.pdm.version]
 source = "file"
@@ -114,7 +115,8 @@ known-first-party = ["m4"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-m 'not requires_mimic_iv'"
+pythonpath = ["src"]
+addopts = "-m 'not requires_mimic_iv' --ignore=benchmark"
 markers = [
     "requires_mimic_iv: test requires local MIMIC-IV data (run with: uv run pytest -m requires_mimic_iv)",
 ]

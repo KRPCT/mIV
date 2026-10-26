@@ -13,6 +13,7 @@ from m4.core.backends.base import (
     TableNotFoundError,
     sanitize_error_message,
 )
+from m4.core.context import M4ExecutionContext
 from m4.core.datasets import DatasetDefinition
 from m4.core.validation import (
     parse_backtick_bigquery_table_name,
@@ -86,7 +87,7 @@ class BigQueryBackend:
         # Priority 3: Default
         return "physionet-data"
 
-    def _get_client(self) -> Any:
+    def _get_client(self, context: M4ExecutionContext | None = None) -> Any:
         """Get or create a BigQuery client.
 
         Clients are cached to avoid re-initialization overhead.
@@ -107,9 +108,12 @@ class BigQueryBackend:
                 backend=self.name,
             )
 
-        from m4.config import get_bigquery_project_id
+        if context:
+            project_id = context.project_id
+        else:
+            from m4.config import get_bigquery_project_id
 
-        project_id = get_bigquery_project_id()
+            project_id = get_bigquery_project_id()
 
         # Check cache
         if (
@@ -164,7 +168,12 @@ class BigQueryBackend:
 
         return sql
 
-    def execute_query(self, sql: str, dataset: DatasetDefinition) -> QueryResult:
+    def execute_query(
+        self,
+        sql: str,
+        dataset: DatasetDefinition,
+        context: M4ExecutionContext | None = None,
+    ) -> QueryResult:
         """Execute a SQL query against BigQuery.
 
         Args:
@@ -181,7 +190,7 @@ class BigQueryBackend:
                 error=(
                     f"Dataset '{dataset.name}' is not available in BigQuery. "
                     f"Use 'm4 backend duckdb' to switch to local database, "
-                    f"or 'm4 use <dataset>' to choose a BigQuery-enabled dataset."
+                    f"or pass a BigQuery-enabled dataset explicitly."
                 ),
             )
 
@@ -190,7 +199,7 @@ class BigQueryBackend:
             import pandas as pd
             from google.cloud import bigquery as bq
 
-            client = self._get_client()
+            client = self._get_client(context)
 
             job_config = bq.QueryJobConfig()
             query_job = client.query(sql, job_config=job_config)
@@ -217,7 +226,11 @@ class BigQueryBackend:
                 error=sanitize_error_message(e, self.name),
             )
 
-    def get_table_list(self, dataset: DatasetDefinition) -> list[str]:
+    def get_table_list(
+        self,
+        dataset: DatasetDefinition,
+        context: M4ExecutionContext | None = None,
+    ) -> list[str]:
         """Get list of available tables in the dataset.
 
         Returns canonical schema.table names (e.g., mimiciv_hosp.patients).
@@ -245,7 +258,11 @@ class BigQueryBackend:
             SELECT table_name
             FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES`
             """
-            result = self.execute_query(query, dataset)
+            result = (
+                self.execute_query(query, dataset, context)
+                if context
+                else self.execute_query(query, dataset)
+            )
 
             if result.error or result.dataframe is None:
                 continue
@@ -259,7 +276,10 @@ class BigQueryBackend:
         return sorted(tables)
 
     def get_table_info(
-        self, table_name: str, dataset: DatasetDefinition
+        self,
+        table_name: str,
+        dataset: DatasetDefinition,
+        context: M4ExecutionContext | None = None,
     ) -> QueryResult:
         """Get schema information for a specific table.
 
@@ -333,7 +353,11 @@ class BigQueryBackend:
             ORDER BY ordinal_position
             """
 
-            result = self.execute_query(query, dataset)
+            result = (
+                self.execute_query(query, dataset, context)
+                if context
+                else self.execute_query(query, dataset)
+            )
             if result.error or result.dataframe is None or result.dataframe.empty:
                 raise TableNotFoundError(table_name, backend=self.name)
             return result
@@ -345,7 +369,7 @@ class BigQueryBackend:
                 error=(
                     f"Dataset '{dataset.name}' is not available in BigQuery. "
                     f"Use 'm4 backend duckdb' to switch to local database, "
-                    f"or 'm4 use <dataset>' to choose a BigQuery-enabled dataset."
+                    f"or pass a BigQuery-enabled dataset explicitly."
                 ),
             )
 
@@ -368,7 +392,11 @@ class BigQueryBackend:
             ORDER BY ordinal_position
             """
 
-            result = self.execute_query(query, dataset)
+            result = (
+                self.execute_query(query, dataset, context)
+                if context
+                else self.execute_query(query, dataset)
+            )
             if (
                 not result.error
                 and result.dataframe is not None
@@ -379,7 +407,11 @@ class BigQueryBackend:
         raise TableNotFoundError(table_name, backend=self.name)
 
     def get_sample_data(
-        self, table_name: str, dataset: DatasetDefinition, limit: int = 3
+        self,
+        table_name: str,
+        dataset: DatasetDefinition,
+        limit: int = 3,
+        context: M4ExecutionContext | None = None,
     ) -> QueryResult:
         """Get sample rows from a table.
 
@@ -464,7 +496,11 @@ class BigQueryBackend:
                     )
 
             query = f"SELECT * FROM {full_name} LIMIT {limit}"
-            return self.execute_query(query, dataset)
+            return (
+                self.execute_query(query, dataset, context)
+                if context
+                else self.execute_query(query, dataset)
+            )
 
         # Simple name - find in configured datasets
         if not dataset.bigquery_dataset_ids:
@@ -473,7 +509,7 @@ class BigQueryBackend:
                 error=(
                     f"Dataset '{dataset.name}' is not available in BigQuery. "
                     f"Use 'm4 backend duckdb' to switch to local database, "
-                    f"or 'm4 use <dataset>' to choose a BigQuery-enabled dataset."
+                    f"or pass a BigQuery-enabled dataset explicitly."
                 ),
             )
 
@@ -492,7 +528,11 @@ class BigQueryBackend:
             full_name = f"`{project_id}.{dataset_id}.{table_name}`"
             query = f"SELECT * FROM {full_name} LIMIT {limit}"
 
-            result = self.execute_query(query, dataset)
+            result = (
+                self.execute_query(query, dataset, context)
+                if context
+                else self.execute_query(query, dataset)
+            )
             if not result.error:
                 return result
 
@@ -501,11 +541,15 @@ class BigQueryBackend:
             error=f"Table '{table_name}' not found in any configured dataset",
         )
 
-    def get_backend_info(self, dataset: DatasetDefinition) -> str:
+    def get_backend_info(
+        self,
+        dataset: DatasetDefinition,
+        context: M4ExecutionContext | None = None,
+    ) -> str:
         """Get human-readable information about the current backend.
 
         Args:
-            dataset: The active dataset definition
+            dataset: The dataset definition
 
         Returns:
             Formatted string with backend details
@@ -519,7 +563,7 @@ class BigQueryBackend:
 
         return (
             f"**Current Backend:** BigQuery (cloud database)\n"
-            f"**Active Dataset:** {dataset.name}\n"
+            f"**Dataset:** {dataset.name}\n"
             f"**Project ID:** {project_id}\n"
             f"**Dataset IDs:** {dataset_ids}"
         )

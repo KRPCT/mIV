@@ -1696,6 +1696,7 @@ dependencies = [
     { name = "requests" },
     { name = "rich" },
     { name = "sqlparse" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "typer" },
     { name = "vitrine" },
 ]
@@ -1737,8 +1738,9 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'research'", specifier = ">=1.7.2" },
     { name = "sqlparse", specifier = ">=0.4.0" },
     { name = "statsmodels", marker = "extra == 'research'", specifier = ">=0.14.6" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
     { name = "typer", specifier = ">=0.9.0" },
-    { name = "vitrine", git = "https://github.com/hannesill/vitrine.git" },
+    { name = "vitrine", specifier = ">=0.1.5" },
 ]
 provides-extras = ["research"]
 
@@ -3845,16 +3847,22 @@ wheels = [
 
 [[package]]
 name = "vitrine"
-version = "0.1.0"
-source = { git = "https://github.com/hannesill/vitrine.git#d4d531a223f3a2ceb21b470b3f7d867952298c08" }
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
     { name = "pandas" },
+    { name = "pillow" },
     { name = "pyarrow" },
     { name = "rich" },
     { name = "starlette" },
     { name = "typer" },
     { name = "uvicorn" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/d9/cfdbae52241585b53ca4b1a4da12d524d28c20304a032a62af46812008aa/vitrine-0.1.5.tar.gz", hash = "sha256:a78e31efa803d7e7da1bbba94e65991a680bcfcd711e8b0a03e7c2163e73dd32", size = 1646571, upload-time = "2026-10-19T03:32:19.705Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/4a/375d70805d71d7ca15bdc95ed51f691de4504251d5b42e26081de9107b96/vitrine-0.1.5-py3-none-any.whl", hash = "sha256:654c71d4ceb3e8815c184fe20f90b767df5cccb03450252920862038c810c33d", size = 1607165, upload-time = "2026-10-19T03:32:18.261Z" },
 ]
 
 [[package]]

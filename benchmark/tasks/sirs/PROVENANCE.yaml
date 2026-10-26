@@ -1,0 +1,34 @@
+sources:
+  - description: M4Bench SIRS raw-table task instruction and bundled task skills
+    files:
+      - mimic-sirs-24h-raw/task.toml
+      - mimic-sirs-24h-raw/instruction.md
+      - mimic-sirs-24h-raw/skills/sirs-criteria/SKILL.md
+      - mimic-sirs-24h-raw/skills-rawsql/mimic-sirs-24h-raw/SKILL.md
+      - mimic-sirs-24h-raw/skills-decoy/meld-score/SKILL.md
+
+applies_to:
+  - mimic-sirs-24h-raw
+
+created:
+  by: m4bench task authoring
+  role: benchmark-task-construction
+  date: unknown
+
+reviews:
+  - by: Ryohei Kobayashi-Yamamoto, MD
+    date: 2026-05-03
+    scope: clinical-accuracy, task-instruction-consistency
+    notes: Reviewed instruction.md and bundled skill files, including SIRS criteria and decoy MELD skill, for clinical accuracy, task alignment, and benchmark suitability. No major clinical concerns identified.
+
+  - by: Dukyong Yoon, MD
+    date: 2026-05-05
+    scope: clinical-accuracy, second-review
+    notes: Second clinical review for the family-level provenance record; reviewed task definition, bundled skills, source alignment, and benchmark suitability.
+
+references: []
+
+changelog:
+  - version: "1.0"
+    date: 2026-05-03
+    summary: Added draft provenance record for M4Bench task review; original task creation date not verified.

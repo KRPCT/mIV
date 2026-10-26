@@ -20,6 +20,7 @@ from typing import Any
 import pandas as pd
 
 from m4.core.backends import get_backend
+from m4.core.context import M4ExecutionContext
 from m4.core.datasets import DatasetDefinition, Modality
 from m4.core.exceptions import QueryError
 from m4.core.tools.base import ToolInput
@@ -31,6 +32,42 @@ class NoteType(str, Enum):
     DISCHARGE = "discharge"
     RADIOLOGY = "radiology"
     ALL = "all"
+
+
+MAX_NOTE_QUERY_LIMIT = 100
+MAX_SNIPPET_LENGTH = 10_000
+MAX_NOTE_LENGTH = 200_000
+KNOWN_NOTE_TYPES = {item.value for item in NoteType}
+
+
+def quote_sql_literal(value: str) -> str:
+    """Return a single-quoted SQL string literal with quotes escaped."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def validate_positive_int(value: int, *, name: str, maximum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise QueryError(f"{name} must be an integer.")
+    if value <= 0:
+        raise QueryError(f"{name} must be positive.")
+    if value > maximum:
+        raise QueryError(f"{name} must be less than or equal to {maximum}.")
+    return value
+
+
+def validate_note_type(note_type: str) -> str:
+    normalized = note_type.lower().strip() if isinstance(note_type, str) else ""
+    if normalized not in KNOWN_NOTE_TYPES:
+        raise QueryError(
+            f"Invalid note_type '{note_type}'. Use 'discharge', 'radiology', or 'all'."
+        )
+    return normalized
+
+
+def validate_non_empty_text(value: str, *, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise QueryError(f"{name} must be a non-empty string.")
+    return value.strip()
 
 
 # Input models
@@ -83,7 +120,10 @@ class SearchNotesTool:
     supported_datasets: frozenset[str] | None = None
 
     def invoke(
-        self, dataset: DatasetDefinition, params: SearchNotesInput
+        self,
+        dataset: DatasetDefinition,
+        params: SearchNotesInput,
+        context: M4ExecutionContext | None = None,
     ) -> dict[str, Any]:
         """Search notes and return snippets around matches.
 
@@ -97,20 +137,25 @@ class SearchNotesTool:
         Raises:
             QueryError: If note_type is invalid
         """
-        backend = get_backend()
+        backend = context.backend if context else get_backend()
+        query = validate_non_empty_text(params.query, name="query")
+        note_type = validate_note_type(params.note_type)
+        limit = validate_positive_int(
+            params.limit, name="limit", maximum=MAX_NOTE_QUERY_LIMIT
+        )
+        snippet_length = validate_positive_int(
+            params.snippet_length,
+            name="snippet_length",
+            maximum=MAX_SNIPPET_LENGTH,
+        )
 
         # Determine which tables to search
-        tables_to_search = self._get_tables_for_type(params.note_type)
-
-        if not tables_to_search:
-            raise QueryError(
-                f"Invalid note_type '{params.note_type}'. "
-                "Use 'discharge', 'radiology', or 'all'."
-            )
+        tables_to_search = self._get_tables_for_type(note_type)
 
         results: dict[str, pd.DataFrame] = {}
         errors: list[str] = []
-        search_term = params.query.replace("'", "''")  # Escape single quotes
+        search_literal = quote_sql_literal(query)
+        search_like_literal = quote_sql_literal(f"%{query.lower()}%")
 
         for table in tables_to_search:
             # Build search query with snippet extraction
@@ -120,30 +165,38 @@ class SearchNotesTool:
                     note_id,
                     subject_id,
                     CASE
-                        WHEN STRPOS(LOWER(text), LOWER('{search_term}')) > 0 THEN
+                        WHEN STRPOS(LOWER(text), LOWER({search_literal})) > 0 THEN
                             SUBSTRING(
                                 text,
-                                GREATEST(1, STRPOS(LOWER(text), LOWER('{search_term}')) - {params.snippet_length // 2}),
-                                {params.snippet_length}
+                                GREATEST(1, STRPOS(LOWER(text), LOWER({search_literal})) - {snippet_length // 2}),
+                                {snippet_length}
                             )
-                        ELSE LEFT(text, {params.snippet_length})
+                        ELSE LEFT(text, {snippet_length})
                     END as snippet,
                     LENGTH(text) as note_length
                 FROM {table}
-                WHERE LOWER(text) LIKE '%{search_term.lower()}%'
-                LIMIT {params.limit}
+                WHERE LOWER(text) LIKE {search_like_literal}
+                LIMIT {limit}
             """
 
-            result = backend.execute_query(sql, dataset)
+            result = (
+                backend.execute_query(sql, dataset, context)
+                if context
+                else backend.execute_query(sql, dataset)
+            )
             if result.success and result.dataframe is not None:
                 results[table] = result.dataframe
             elif result.error:
                 errors.append(f"{table}: {result.error}")
 
         response: dict[str, Any] = {
-            "backend_info": backend.get_backend_info(dataset),
-            "query": params.query,
-            "snippet_length": params.snippet_length,
+            "backend_info": (
+                backend.get_backend_info(dataset, context)
+                if context
+                else backend.get_backend_info(dataset)
+            ),
+            "query": query,
+            "snippet_length": snippet_length,
             "results": results,
         }
         if errors:
@@ -191,7 +244,10 @@ class GetNoteTool:
     supported_datasets: frozenset[str] | None = None
 
     def invoke(
-        self, dataset: DatasetDefinition, params: GetNoteInput
+        self,
+        dataset: DatasetDefinition,
+        params: GetNoteInput,
+        context: M4ExecutionContext | None = None,
     ) -> dict[str, Any]:
         """Retrieve a single note by ID.
 
@@ -207,10 +263,17 @@ class GetNoteTool:
         Raises:
             QueryError: If note not found
         """
-        backend = get_backend()
+        backend = context.backend if context else get_backend()
+        note_id = validate_non_empty_text(params.note_id, name="note_id")
+        max_length = params.max_length
+        if max_length is not None:
+            max_length = validate_positive_int(
+                max_length,
+                name="max_length",
+                maximum=MAX_NOTE_LENGTH,
+            )
 
-        # Note IDs contain the note type (e.g., "10000032_DS-1" for discharge)
-        note_id = params.note_id.replace("'", "''")
+        note_id_literal = quote_sql_literal(note_id)
 
         # Try both tables since we may not know which one contains the note
         errors: list[str] = []
@@ -222,11 +285,15 @@ class GetNoteTool:
                     text,
                     LENGTH(text) as note_length
                 FROM {table}
-                WHERE note_id = '{note_id}'
+                WHERE note_id = {note_id_literal}
                 LIMIT 1
             """
 
-            result = backend.execute_query(sql, dataset)
+            result = (
+                backend.execute_query(sql, dataset, context)
+                if context
+                else backend.execute_query(sql, dataset)
+            )
             if result.error:
                 errors.append(f"{table}: {result.error}")
                 continue
@@ -241,12 +308,16 @@ class GetNoteTool:
                 truncated = False
 
                 # Optionally truncate if max_length specified
-                if params.max_length and len(text) > params.max_length:
-                    text = text[: params.max_length]
+                if max_length and len(text) > max_length:
+                    text = text[:max_length]
                     truncated = True
 
                 return {
-                    "backend_info": backend.get_backend_info(dataset),
+                    "backend_info": (
+                        backend.get_backend_info(dataset, context)
+                        if context
+                        else backend.get_backend_info(dataset)
+                    ),
                     "note_id": str(row["note_id"]),
                     "subject_id": int(row["subject_id"]),
                     "text": text,
@@ -254,7 +325,7 @@ class GetNoteTool:
                     "truncated": truncated,
                 }
 
-        error_msg = f"Note '{params.note_id}' not found."
+        error_msg = f"Note '{note_id}' not found."
         if errors:
             error_msg += " Backend errors: " + "; ".join(errors)
         error_msg += (
@@ -294,7 +365,10 @@ class ListPatientNotesTool:
     supported_datasets: frozenset[str] | None = None
 
     def invoke(
-        self, dataset: DatasetDefinition, params: ListPatientNotesInput
+        self,
+        dataset: DatasetDefinition,
+        params: ListPatientNotesInput,
+        context: M4ExecutionContext | None = None,
     ) -> dict[str, Any]:
         """List notes for a patient without returning full text.
 
@@ -307,15 +381,16 @@ class ListPatientNotesTool:
         Raises:
             QueryError: If note_type is invalid
         """
-        backend = get_backend()
+        backend = context.backend if context else get_backend()
+        note_type = validate_note_type(params.note_type)
+        limit = validate_positive_int(
+            params.limit, name="limit", maximum=MAX_NOTE_QUERY_LIMIT
+        )
+        subject_id = validate_positive_int(
+            params.subject_id, name="subject_id", maximum=9_999_999_999
+        )
 
-        tables_to_query = self._get_tables_for_type(params.note_type)
-
-        if not tables_to_query:
-            raise QueryError(
-                f"Invalid note_type '{params.note_type}'. "
-                "Use 'discharge', 'radiology', or 'all'."
-            )
+        tables_to_query = self._get_tables_for_type(note_type)
 
         notes: dict[str, pd.DataFrame] = {}
         errors: list[str] = []
@@ -330,19 +405,27 @@ class ListPatientNotesTool:
                     LENGTH(text) as note_length,
                     LEFT(text, 100) as preview
                 FROM {table}
-                WHERE subject_id = {params.subject_id}
-                LIMIT {params.limit}
+                WHERE subject_id = {subject_id}
+                LIMIT {limit}
             """
 
-            result = backend.execute_query(sql, dataset)
+            result = (
+                backend.execute_query(sql, dataset, context)
+                if context
+                else backend.execute_query(sql, dataset)
+            )
             if result.success and result.dataframe is not None:
                 notes[table] = result.dataframe
             elif result.error:
                 errors.append(f"{table}: {result.error}")
 
         response: dict[str, Any] = {
-            "backend_info": backend.get_backend_info(dataset),
-            "subject_id": params.subject_id,
+            "backend_info": (
+                backend.get_backend_info(dataset, context)
+                if context
+                else backend.get_backend_info(dataset)
+            ),
+            "subject_id": subject_id,
             "notes": notes,
         }
         if errors:

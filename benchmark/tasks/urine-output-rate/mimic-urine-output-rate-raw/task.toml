@@ -1,0 +1,47 @@
+[metadata]
+name = "mimic-urine-output-rate-raw"
+description = "Calculate rolling urine output rates (raw tables) for ICU patients from MIMIC-IV data"
+difficulty = "expert"
+mode = "raw"  # task-relevant upstream tables dropped
+category = "Healthcare"
+tags = ["clinical", "icu", "nephrology", "mimic-iv", "urine-output", "temporal", "raw"]
+database = "mimic-iv"
+
+[database]
+source = "mimic-iv"
+drop_tables = [
+    "mimiciv_derived.first_day_urine_output",
+    "mimiciv_derived.first_day_weight",
+    "mimiciv_derived.icustay_detail",
+    "mimiciv_derived.icustay_hourly",
+    "mimiciv_derived.icustay_times",
+    "mimiciv_derived.kdigo_creatinine",
+    "mimiciv_derived.kdigo_stages",
+    "mimiciv_derived.urine_output_rate",
+    "mimiciv_derived.kdigo_uo",
+    "mimiciv_derived.urine_output",
+    "mimiciv_derived.weight_durations",
+]
+
+[ground_truth]
+alias = "urine-output-rate"  # same clinical concept
+
+[evaluation]
+key_columns = ["stay_id", "charttime"]
+value_columns = ["uo_mlkghr_6hr", "uo_mlkghr_12hr", "uo_mlkghr_24hr", "urineoutput_6hr", "urineoutput_12hr", "urineoutput_24hr"]
+required_columns = ["stay_id", "charttime", "weight", "uo", "urineoutput_6hr", "urineoutput_12hr", "urineoutput_24hr", "uo_mlkghr_6hr", "uo_mlkghr_12hr", "uo_mlkghr_24hr", "uo_tm_6hr", "uo_tm_12hr", "uo_tm_24hr"]
+row_coverage_threshold = 0.95
+accuracy_threshold = 0.85
+
+[evaluation.tolerance]
+weight = 0.01
+uo = 0.01
+uo_mlkghr_6hr = 0.01
+uo_mlkghr_12hr = 0.01
+uo_mlkghr_24hr = 0.01
+urineoutput_6hr = 0.01
+urineoutput_12hr = 0.01
+urineoutput_24hr = 0.01
+uo_tm_6hr = 0.01
+uo_tm_12hr = 0.01
+uo_tm_24hr = 0.01

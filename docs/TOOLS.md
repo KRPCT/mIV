@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-M4 exposes these tools to AI clients via the Model Context Protocol. Tools are filtered based on the active dataset's modality.
+M4 exposes these tools to AI clients via the Model Context Protocol. Data tools take an explicit `dataset` parameter and are checked against that dataset's modality.
 
 ## Dataset Management
 
@@ -12,35 +12,33 @@ List all available datasets and their status.
 **Example response:**
 ```
 Available datasets:
-- mimic-iv-demo (active) - MIMIC-IV Clinical Database Demo [TABULAR]
+- mimic-iv-demo - MIMIC-IV Clinical Database Demo [TABULAR]
 - mimic-iv - MIMIC-IV Clinical Database [TABULAR]
 - mimic-iv-note - MIMIC-IV Clinical Notes [NOTES]
+- mimic-iv-ed-demo - MIMIC-IV-ED Demo [TABULAR]
+- mimic-iv-ed - MIMIC-IV Emergency Department Module [TABULAR]
+- eicu-demo - eICU Collaborative Research Database Demo [TABULAR]
 - eicu - eICU Collaborative Research Database [TABULAR]
+- mimic-iii - MIMIC-III Clinical Database [TABULAR]
+- mimic-cxr-jpg - MIMIC-CXR-JPG chest radiographs with structured labels [IMAGING, TABULAR]
 ```
 
 ### `set_dataset`
-Switch the active dataset.
-
-**Parameters:**
-- `dataset_name` (string, required): Name of the dataset to activate
-
-**Example:**
-```
-set_dataset("mimic-iv-note")
-```
+Removed. The compatibility tool returns migration guidance; pass `dataset` to the data tool call instead.
 
 ---
 
 ## Tabular Data Tools
 
-These tools are available for datasets with the `TABULAR` modality (mimic-iv, mimic-iv-demo, eicu).
+These tools are available for datasets with the `TABULAR` modality: every built-in dataset except mimic-iv-note.
 
 **Derived tables:** For MIMIC-IV, after materializing derived tables with `m4 init-derived mimic-iv`, the `execute_query` tool can query pre-computed clinical concept tables in the `mimiciv_derived.*` schema. These tables provide validated severity scores, sepsis cohorts, organ failure staging, and more -- eliminating the need to write complex clinical SQL from scratch. See [Derived Table Categories](#derived-table-categories) below for the full list.
 
 ### `get_database_schema`
-List all tables in the current dataset.
+List all tables in a dataset.
 
-**Parameters:** None
+**Parameters:**
+- `dataset` (string, required): Dataset name
 
 **Returns:** Table names with row counts
 
@@ -49,6 +47,7 @@ Get detailed information about a specific table.
 
 **Parameters:**
 - `table_name` (string, required): Name of the table
+- `dataset` (string, required): Dataset name
 - `sample_rows` (int, optional): Number of sample rows to return (default: 5)
 
 **Returns:** Column names, types, and sample data
@@ -58,6 +57,7 @@ Execute a read-only SQL SELECT query.
 
 **Parameters:**
 - `query` (string, required): SQL SELECT statement
+- `dataset` (string, required): Dataset name
 - `limit` (int, optional): Maximum rows to return (default: 100)
 
 **Security:**
@@ -84,6 +84,7 @@ Full-text search across clinical notes. Returns snippets around matches.
 
 **Parameters:**
 - `query` (string, required): Search term
+- `dataset` (string, required): Dataset name
 - `note_type` (string, optional): Filter by type - `"discharge"`, `"radiology"`, or `"all"` (default: `"all"`)
 - `limit` (int, optional): Maximum results (default: 5)
 - `snippet_length` (int, optional): Characters around match (default: 300)
@@ -102,6 +103,7 @@ Retrieve the full text of a single clinical note by ID.
 
 **Parameters:**
 - `note_id` (string, required): The note identifier (e.g., `"10000032_DS-1"`)
+- `dataset` (string, required): Dataset name
 - `max_length` (int, optional): Truncate output to this length
 
 **Returns:** Full note text (or truncated if `max_length` specified)
@@ -119,6 +121,7 @@ List available notes for a patient. Returns metadata only (IDs, types, lengths) 
 
 **Parameters:**
 - `subject_id` (int, required): Patient identifier
+- `dataset` (string, required): Dataset name
 - `note_type` (string, optional): Filter by type - `"discharge"`, `"radiology"`, or `"all"` (default: `"all"`)
 - `limit` (int, optional): Maximum results (default: 20)
 
@@ -138,16 +141,16 @@ list_patient_notes(10000032, note_type="discharge")
 
 Tools declare required modalities. Only datasets with matching modalities expose the tool:
 
-| Tool | Required Modality | mimic-iv-demo | mimic-iv | mimic-iv-note | eicu |
-|------|-------------------|---------------|----------|---------------|------|
-| `get_database_schema` | TABULAR | Yes | Yes | No | Yes |
-| `get_table_info` | TABULAR | Yes | Yes | No | Yes |
-| `execute_query` | TABULAR | Yes | Yes | No | Yes |
-| `search_notes` | NOTES | No | No | Yes | No |
-| `get_note` | NOTES | No | No | Yes | No |
-| `list_patient_notes` | NOTES | No | No | Yes | No |
-| `list_datasets` | (always) | Yes | Yes | Yes | Yes |
-| `set_dataset` | (always) | Yes | Yes | Yes | Yes |
+| Tool | Required Modality | TABULAR datasets | NOTES datasets (mimic-iv-note) |
+|------|-------------------|------------------|--------------------------------|
+| `get_database_schema` | TABULAR | Yes | No |
+| `get_table_info` | TABULAR | Yes | No |
+| `execute_query` | TABULAR | Yes | No |
+| `search_notes` | NOTES | No | Yes |
+| `get_note` | NOTES | No | Yes |
+| `list_patient_notes` | NOTES | No | Yes |
+| `list_datasets` | (always) | Yes | Yes |
+| `set_dataset` | Removed migration aid | Yes | Yes |
 
 ---
 
@@ -157,14 +160,15 @@ MIMIC-IV and MIMIC-IV-Note are separate datasets that can be linked via `subject
 
 ```
 # 1. Find patients of interest in MIMIC-IV (tabular)
-set_dataset("mimic-iv")
-execute_query("SELECT subject_id FROM mimiciv_hosp.patients WHERE anchor_age > 80 LIMIT 5")
+execute_query(
+    "SELECT subject_id FROM mimiciv_hosp.patients WHERE anchor_age > 80 LIMIT 5",
+    dataset="mimic-iv",
+)
 
-# 2. Switch to notes and explore their clinical narratives
-set_dataset("mimic-iv-note")
-list_patient_notes(10000032)
-search_notes("heart failure", note_type="discharge")
-get_note("10000032_DS-1")
+# 2. Query notes explicitly
+list_patient_notes(10000032, dataset="mimic-iv-note")
+search_notes("heart failure", note_type="discharge", dataset="mimic-iv-note")
+get_note("10000032_DS-1", dataset="mimic-iv-note")
 ```
 
 ---
@@ -180,7 +184,7 @@ This tool requires the NOTES modality, but 'mimic-iv' only has: TABULAR
 
 Suggestions:
    - Use `list_datasets()` to see all available datasets
-   - Use `set_dataset('mimic-iv-note')` to switch to a notes dataset
+   - Pass `dataset='mimic-iv-note'` to use a notes dataset
 ```
 
 ---
@@ -202,17 +206,19 @@ Use the `note_type` parameter to filter searches and listings.
 
 After running `m4 init-derived mimic-iv`, the following pre-computed tables become available in the `mimiciv_derived` schema. Query them with `execute_query` like any other table (e.g., `SELECT * FROM mimiciv_derived.sofa LIMIT 10`).
 
+<!-- BEGIN GENERATED DERIVED TABLES -->
 | Category | Tables | Description |
 |----------|--------|-------------|
-| **Scores** | `sofa`, `sapsii`, `apsiii`, `oasis`, `lods`, `sirs` | Severity and mortality prediction scores |
-| **Sepsis** | `sepsis3`, `suspicion_of_infection` | Sepsis-3 cohort identification and suspected infection events |
-| **Organ Failure** | `kdigo_creatinine`, `kdigo_uo`, `kdigo_stages`, `meld` | KDIGO AKI staging and MELD liver score |
-| **Medications** | `norepinephrine`, `epinephrine`, `dopamine`, `dobutamine`, `phenylephrine`, `vasopressin`, `milrinone`, `norepinephrine_equivalent_dose`, `vasoactive_agent`, `antibiotic`, `acei`, `nsaid`, `neuroblock` | Individual vasopressors, equivalents, and other drug classes |
-| **Measurements** | `vitalsign`, `bg`, `blood_gas`, `chemistry`, `complete_blood_count`, `coagulation`, `cardiac_marker`, `enzyme`, `inflammation`, `icp`, `height`, `urine_output`, `urine_output_rate`, `ventilator_setting`, `oxygen_delivery`, `rhythm`, `gcs`, `creatinine_baseline`, `blood_differential` | Labs, vitals, and clinical measurements |
-| **Demographics** | `age`, `icustay_detail`, `icustay_times`, `icustay_hourly`, `weight_durations` | Patient demographics and ICU stay metadata |
-| **First Day** | `first_day_bg`, `first_day_bg_art`, `first_day_gcs`, `first_day_height`, `first_day_lab`, `first_day_rrt`, `first_day_sofa`, `first_day_urine_output`, `first_day_vitalsign`, `first_day_weight` | Aggregated values from the first 24 hours of ICU admission |
-| **Treatment** | `ventilation`, `rrt`, `crrt`, `invasive_line` | Mechanical ventilation, renal replacement therapy, and lines |
+| **Demographics** | `icustay_times`, `icustay_hourly`, `weight_durations`, `age`, `icustay_detail` | Patient demographics and ICU stay metadata |
+| **Measurements** | `urine_output`, `bg`, `blood_differential`, `cardiac_marker`, `chemistry`, `coagulation`, `complete_blood_count`, `creatinine_baseline`, `enzyme`, `gcs`, `height`, `icp`, `inflammation`, `oxygen_delivery`, `rhythm`, `urine_output_rate`, `ventilator_setting`, `vitalsign` | Labs, vitals, and clinical measurements |
+| **Organ Failure** | `kdigo_uo`, `kdigo_creatinine`, `meld`, `kdigo_stages` | KDIGO AKI staging and MELD liver score |
 | **Comorbidity** | `charlson` | Charlson comorbidity index |
+| **Medications** | `acei`, `antibiotic`, `dobutamine`, `dopamine`, `epinephrine`, `milrinone`, `neuroblock`, `norepinephrine`, `nsaid`, `phenylephrine`, `vasopressin`, `vasoactive_agent`, `norepinephrine_equivalent_dose` | Individual vasopressors, equivalents, and other drug classes |
+| **Treatment** | `crrt`, `invasive_line`, `rrt`, `ventilation` | Mechanical ventilation, renal replacement therapy, and lines |
+| **First Day** | `first_day_bg`, `first_day_bg_art`, `first_day_gcs`, `first_day_height`, `first_day_lab`, `first_day_rrt`, `first_day_urine_output`, `first_day_vitalsign`, `first_day_weight`, `first_day_sofa` | Aggregated values from the first 24 hours of ICU admission |
+| **Scores** | `apsiii`, `lods`, `oasis`, `sapsii`, `sirs`, `sofa` | Severity and mortality prediction scores |
+| **Sepsis** | `suspicion_of_infection`, `sepsis3` | Sepsis-3 cohort identification and suspected infection events |
+<!-- END GENERATED DERIVED TABLES -->
 
 These tables are materialized from vendored [mimic-code](https://github.com/MIT-LCP/mimic-code) SQL and are available for MIMIC-IV only (not mimic-iv-demo or eICU). BigQuery users already have access via `physionet-data.mimiciv_derived`.
 
@@ -228,10 +234,12 @@ For complex analysis beyond simple queries, M4 provides a Python API that return
 - Building reproducible analysis notebooks
 
 ```python
-from m4 import set_dataset, execute_query
+from m4 import execute_query
 
-set_dataset("mimic-iv")
-df = execute_query("SELECT * FROM mimiciv_hosp.patients")  # Returns pandas DataFrame
+df = execute_query(
+    "SELECT * FROM mimiciv_hosp.patients",
+    dataset="mimic-iv",
+)  # Returns pandas DataFrame
 ```
 
 See [Code Execution Guide](CODE_EXECUTION.md) for the full API reference.

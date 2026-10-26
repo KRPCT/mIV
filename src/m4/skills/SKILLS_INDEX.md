@@ -30,12 +30,14 @@ This directory contains skills for the M4 framework, covering clinical research 
 | Skill | Description |
 |-------|-------------|
 | [kdigo-aki-staging](clinical/kdigo-aki-staging/SKILL.md) | KDIGO AKI staging using creatinine and urine output |
+| [meld-score](clinical/meld-score/SKILL.md) | MELD score for liver disease severity and transplant prioritization |
 
 ### Medications and Treatments
 
 | Skill | Description |
 |-------|-------------|
 | [vasopressor-equivalents](clinical/vasopressor-equivalents/SKILL.md) | Norepinephrine-equivalent dose calculation |
+| [ventilation-classification](clinical/ventilation-classification/SKILL.md) | Ventilation status classification and episode detection |
 
 ### Laboratory and Measurements
 
@@ -72,23 +74,26 @@ This directory contains skills for the M4 framework, covering clinical research 
 | Skill | Description |
 |-------|-------------|
 | [m4-api](system/m4-api/SKILL.md) | Python API for M4 clinical data queries |
-| [clinical-research-session](system/clinical-research-session/SKILL.md) | Structured clinical research workflow and protocol drafting |
+| [clinical-research-session](system/clinical-research-session/SKILL.md) | Run a study with the researcher from question to results: interview, protocol, scripts, cards |
+| [m4-setup](system/m4-setup/SKILL.md) | Diagnose and repair M4 environment, dataset, skill, backend, and vitrine setup issues |
+| [vitrine-api](system/vitrine-api/SKILL.md) | Publish cards to the researcher's Vitrine board and read back cards, decisions, and annotations |
 | [create-m4-skill](system/create-m4-skill/SKILL.md) | Guide for creating new M4 skills |
 
 ---
 
 ## Gaps and Future Work
 
-### Concepts Not Yet Extracted
+### Candidate Skills Not Yet Ported
 
-The following valuable concepts exist in the source repositories but were not extracted:
+The following valuable concepts exist in source repositories or clinical workflows but have not yet been converted into M4 skills:
 
-1. **APACHE-II Score**: Older scoring system, still used in some contexts
-2. **Ventilation Duration**: Time on mechanical ventilation
-3. **Antibiotic Classification**: Categorization by class/spectrum
-4. **MELD Score**: Model for End-Stage Liver Disease
-5. **CRRT Concepts**: Continuous renal replacement therapy details
-6. **Code Status**: DNR/DNI documentation
+| Priority | Candidate Skill | Rationale |
+|----------|-----------------|-----------|
+| High | **Ventilation Duration** | Common ICU exposure/outcome; episode logic, gaps, tracheostomy, NIV, and HFNC handling are easy to misuse. |
+| High | **Antibiotic Classification** | Needed for infection, sepsis, and stewardship studies; drug naming and class/spectrum mapping require curated logic. |
+| High | **CRRT Concepts** | Important for AKI, shock, severity scoring, and renal replacement adjustment; timing and modality distinctions matter. |
+| Medium | **Code Status** | DNR/DNI and comfort-care documentation can affect mortality analyses, but extraction is often institution-specific and incomplete. |
+| Medium | **APACHE-II Score** | Clinically recognizable historical score, but lower priority because M4 already includes newer severity scores. |
 
 ### eICU-Specific Concepts Needed
 

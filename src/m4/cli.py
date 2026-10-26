@@ -1,23 +1,28 @@
+import json
 import logging
-import subprocess
+import math
+import os
 import sys
+from contextlib import contextmanager, nullcontext
+from dataclasses import is_dataclass
+from datetime import date, datetime, time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
+import pandas as pd
 import typer
 
+from m4.client import M4Client
 from m4.config import (
-    VALID_BACKENDS,
-    detect_available_local_datasets,
+    ensure_custom_datasets_loaded,
     get_active_backend,
-    get_active_dataset,
-    get_bigquery_project_id,
+    get_active_dataset,  # noqa: F401 - retained for compatibility patch targets
     get_dataset_parquet_root,
     get_default_database_path,
+    get_telemetry_dir,
     logger,
-    set_active_backend,
-    set_active_dataset,
-    set_bigquery_project_id,
+    resolve_runtime_context,
+    set_active_dataset,  # noqa: F401 - retained for compatibility patch targets
 )
 from m4.console import (
     console,
@@ -40,34 +45,360 @@ from m4.core.datasets import DatasetRegistry
 from m4.core.derived.builtins import (
     get_tables_by_category,
     has_derived_support,
-    list_builtins,
 )
 from m4.core.derived.materializer import (
     get_derived_table_count,
     list_materialized_tables,
     materialize_all,
 )
-from m4.core.exceptions import DatasetError
+from m4.core.exceptions import M4Error
+from m4.core.raw_files import has_raw_files
+from m4.core.tools import init_tools
 from m4.data_io import (
-    compute_parquet_dir_size,
+    WARNING_CSV_READ_AS_LATIN1,
+    WARNING_DECIMAL_COMMA_COLUMNS,
+    CsvConversionError,
+    DatasetDownloadError,
+    PhysioNetCredentials,
     convert_csv_to_parquet,
     download_dataset,
+    find_unconverted,
     init_duckdb_from_parquet,
+    mark_dataset_prepared,
+    unfinished_download,
     verify_table_rowcount,
 )
+from m4.services.agent_env import build_agent_env_service
+from m4.services.backend import set_active_backend_service
+from m4.services.config import (
+    MCPConfigRequest,
+    configure_mcp_service,
+    install_config_skills_service,
+    summarize_generated_config,
+)
+from m4.services.define_dataset import define_dataset_service
+from m4.services.download import build_wget_command, download_dataset_service
+from m4.services.events import EventReporter, NdjsonEventReporter
+from m4.services.fetch_images import MAX_IMAGES, fetch_images_service
+from m4.services.init import initialize_dataset_service, source_problem
+from m4.services.init_derived import init_derived_service
+from m4.services.remove_dataset import remove_dataset_service
+from m4.services.results import CommandError, CommandResult
+from m4.services.setup import doctor_service, quickstart_service, setup_agent_service
+from m4.services.status import collect_status_snapshot
+from m4.services.use import set_active_dataset_service
 
 app = typer.Typer(
     name="m4",
     help="M4 CLI: Initialize local clinical datasets like MIMIC-IV Demo.",
     add_completion=False,
     rich_markup_mode="markdown",
+    # A traceback that prints local variables prints whatever is in scope when
+    # M4 crashes, a PhysioNet login included.
+    pretty_exceptions_show_locals=False,
 )
+
+provenance_app = typer.Typer(help="Inspect and export M4 provenance events.")
+app.add_typer(provenance_app, name="provenance")
+
+skills_app = typer.Typer(
+    help="Install, inspect, and materialize M4 skills.",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+app.add_typer(skills_app, name="skills")
 
 
 def version_callback(value: bool):
     if value:
         print_logo(show_tagline=True, show_version=True)
         raise typer.Exit()
+
+
+@contextmanager
+def _silence_m4_logging():
+    """Temporarily silence m4 logging so machine output stays parseable."""
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(previous_disable_level)
+
+
+def _emit_json(payload: dict[str, Any]) -> None:
+    typer.echo(json.dumps(_jsonable(payload), indent=2, allow_nan=False))
+
+
+def _emit_command_json(result: CommandResult | CommandError) -> None:
+    _emit_json(result.to_json_dict())
+
+
+@contextmanager
+def _silence_console_output():
+    previous_quiet = console.quiet
+    console.quiet = True
+    try:
+        yield
+    finally:
+        console.quiet = previous_quiet
+
+
+def _dotenv_lines(values: dict[str, Any]) -> list[str]:
+    lines = []
+    for key, value in values.items():
+        if value is None:
+            continue
+        text = str(value).replace("\n", "\\n")
+        lines.append(f"{key}={text}")
+    return lines
+
+
+def _json_error(command: str, code: str, message: str, hint: str | None = None) -> None:
+    _emit_command_json(
+        CommandError(command=command, code=code, message=message, hint=hint)
+    )
+    raise typer.Exit(code=1)
+
+
+def _agent_error_payload(
+    command: str,
+    code: str,
+    message: str,
+    *,
+    hint: str | None = None,
+    context: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    error_payload: dict[str, Any] = {"code": code, "message": message}
+    if hint:
+        error_payload["hint"] = hint
+    payload = {
+        "version": 1,
+        "ok": False,
+        "command": command,
+        "context": context or {},
+        "error": error_payload,
+        "warnings": warnings or [],
+    }
+    if data is not None:
+        payload["data"] = data  # What the command did before it failed
+    return payload
+
+
+def _agent_success_payload(
+    command: str,
+    data: dict[str, Any],
+    *,
+    context: dict[str, Any],
+    warnings: list[str] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "ok": True,
+        "command": command,
+        "context": context,
+        "data": data,
+        "warnings": warnings or [],
+        "provenance": provenance or {},
+    }
+
+
+def _emit_agent_error(
+    command: str,
+    code: str,
+    message: str,
+    *,
+    hint: str | None = None,
+    context: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    data: dict[str, Any] | None = None,
+) -> None:
+    message = _redact_known_paths(message)
+    hint = _redact_known_paths(hint) if hint else None
+    _emit_json(
+        _agent_error_payload(
+            command,
+            code,
+            message,
+            hint=hint,
+            context=context,
+            warnings=warnings,
+            data=data,
+        )
+    )
+    raise typer.Exit(code=1)
+
+
+def _path_disclosure_enabled() -> bool:
+    return os.getenv("M4_PATH_DISCLOSURE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "paths",
+    }
+
+
+def _redact_known_paths(message: str) -> str:
+    if _path_disclosure_enabled():
+        return message
+
+    replacements: dict[str, str] = {}
+    for env_name, label in (
+        ("M4_DATA_DIR", "<M4_DATA_DIR>"),
+        ("M4_HOME", "<M4_HOME>"),
+        ("M4_TELEMETRY_DIR", "<M4_TELEMETRY_DIR>"),
+    ):
+        value = os.getenv(env_name)
+        if value:
+            path = str(Path(value).expanduser().resolve())
+            replacements[path] = label
+
+    for raw_path, label in sorted(
+        replacements.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        message = message.replace(raw_path, label)
+    return message
+
+
+# Keys of the define-dataset and remove-dataset payloads that hold local paths
+_PATH_KEYS = frozenset(
+    {"path", "resolves_to", "definition_path", "defined_from", "source_kept"}
+)
+
+
+def _hide_raw_paths(value: Any, data_dir: Path) -> Any:
+    """`value` with the local paths under _PATH_KEYS hidden, at any depth.
+
+    Machine output does so unless --paths or M4_PATH_DISCLOSURE asks for them:
+    a path in the data directory reads <M4_DATA_DIR>/..., any other is null.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                _hidden_path(item, data_dir)
+                if key in _PATH_KEYS
+                else _hide_raw_paths(item, data_dir)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_hide_raw_paths(item, data_dir) for item in value]
+    return value
+
+
+def _hidden_path(value: Any, data_dir: Path) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        relative = Path(value).relative_to(data_dir)
+    except ValueError:
+        return None
+    return "/".join(("<M4_DATA_DIR>", *relative.parts))
+
+
+def _dataframe_payload(df: pd.DataFrame | None) -> dict[str, Any] | None:
+    if df is None:
+        return None
+    return {
+        "columns": [str(column) for column in df.columns],
+        "rows": _jsonable(df.to_dict(orient="records")),
+        "row_count": len(df),
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, pd.DataFrame):
+        return _dataframe_payload(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_jsonable(item) for item in value]
+    if is_dataclass(value):
+        return _jsonable(value.__dict__)
+    if _is_missing_value(value):
+        return None
+    if isinstance(value, datetime | date | time | pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "tolist"):
+        try:
+            return _jsonable(value.tolist())
+        except (TypeError, ValueError):
+            pass
+    if hasattr(value, "item"):
+        try:
+            return _jsonable(value.item())
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
+
+
+def _is_missing_value(value: Any) -> bool:
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(missing, bool):
+        return missing
+    if getattr(missing, "shape", None) == ():
+        return bool(missing)
+    return False
+
+
+@contextmanager
+def _runtime_env_override(*, dataset: str | None = None, backend: str | None = None):
+    previous: dict[str, str | None] = {
+        "M4_BACKEND": os.environ.get("M4_BACKEND"),
+    }
+    try:
+        if backend:
+            os.environ["M4_BACKEND"] = backend
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _resolve_agent_dataset(
+    command: str, dataset_name: str | None, context: dict[str, Any]
+):
+    from m4.core.datasets import DatasetRegistry
+
+    effective = dataset_name.lower() if dataset_name else None
+    if not effective:
+        _emit_agent_error(
+            command,
+            "dataset_required",
+            "No dataset was provided.",
+            hint=f"Use: m4 {command} --dataset <dataset> --json",
+            context=context,
+        )
+
+    dataset = DatasetRegistry.get(effective)
+    if dataset is None:
+        supported = ", ".join(ds.name for ds in DatasetRegistry.list_all())
+        _emit_agent_error(
+            command,
+            "dataset_not_found",
+            f"Dataset '{effective}' is not supported or not configured.",
+            hint=f"Supported datasets: {supported}",
+            context=context,
+        )
+    return dataset
 
 
 @app.callback()
@@ -105,6 +436,691 @@ def main_callback(
             handler.setLevel(logging.INFO)
 
 
+@app.command("capabilities")
+def capabilities_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the stable capability manifest as JSON."),
+    ] = False,
+):
+    """Show M4 interfaces, commands, tools, datasets, limits, and policies."""
+    from m4.services.capabilities import build_capabilities_manifest
+
+    manifest = build_capabilities_manifest()
+    if json_output:
+        _emit_json(manifest)
+        return
+
+    console.print("[bold]M4 capabilities[/bold]")
+    console.print(f"Schema version: {manifest['schema_version']}")
+    console.print(
+        "Interfaces: "
+        + ", ".join(
+            sorted(key for key in manifest["interfaces"] if key != "output_formats")
+        )
+    )
+    console.print("Datasets: " + ", ".join(ds["name"] for ds in manifest["datasets"]))
+    console.print("Tools: " + ", ".join(tool["name"] for tool in manifest["tools"]))
+    console.print("Machine output: [command]m4 capabilities --json[/command]")
+
+
+@app.command("doctor")
+def doctor_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print diagnostics as JSON."),
+    ] = False,
+    include_paths: Annotated[
+        bool,
+        typer.Option("--paths", help="Disclose raw local paths in diagnostics."),
+    ] = False,
+):
+    """Run non-mutating diagnostics for local, BigQuery, and MCP setup."""
+    result = doctor_service(include_paths=include_paths)
+    if json_output:
+        _emit_command_json(result)
+        return
+
+    summary = result.data["summary"]
+    if summary["ok"]:
+        success("Doctor checks passed")
+    else:
+        warning("Doctor found setup issues")
+    for check in result.data["checks"]:
+        marker = "OK" if check["ok"] else "FAIL"
+        console.print(f"{marker} {check['name']}: {check['message']}")
+        if not check["ok"] and check.get("hint"):
+            console.print(f"  Hint: {check['hint']}")
+
+
+def _read_physionet_credentials(
+    credentials_file: str | None, from_stdin: bool
+) -> PhysioNetCredentials | None:
+    """Read a PhysioNet login from a JSON file or from standard input.
+
+    Standard input is for a program that starts M4 on a user's behalf: the
+    login then never touches the disk, a command line, or the environment.
+    """
+    if credentials_file and from_stdin:
+        raise ValueError(
+            "Pass --physionet-credentials-file or --physionet-credentials-stdin, not both."
+        )
+    if from_stdin:
+        try:
+            return PhysioNetCredentials.from_json_bytes(sys.stdin.buffer.read())
+        except Exception as exc:
+            raise ValueError(
+                f"Could not read PhysioNet credentials from standard input: {exc}"
+            ) from exc
+    if credentials_file:
+        try:
+            return PhysioNetCredentials.from_json_file(
+                Path(credentials_file).expanduser().resolve()
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Could not read PhysioNet credentials file: {exc}"
+            ) from exc
+    return None
+
+
+@app.command("download")
+def download_cmd(
+    dataset_name: Annotated[
+        str,
+        typer.Argument(help="Dataset to download or prepare download guidance for."),
+    ],
+    target: Annotated[
+        str | None,
+        typer.Option("--target", help="Raw CSV.gz destination root."),
+    ] = None,
+    command_only: Annotated[
+        bool,
+        typer.Option("--command-only", help="Only print/generated command guidance."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON."),
+    ] = False,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            help="Emit structured progress events. Supported: ndjson.",
+        ),
+    ] = None,
+    physionet_credentials_file: Annotated[
+        str | None,
+        typer.Option(
+            "--physionet-credentials-file",
+            help="JSON file containing PhysioNet username and password fields.",
+        ),
+    ] = None,
+    physionet_credentials_stdin: Annotated[
+        bool,
+        typer.Option(
+            "--physionet-credentials-stdin",
+            help="Read the PhysioNet credentials JSON from standard input.",
+        ),
+    ] = False,
+):
+    """Download public datasets or generate credentialed PhysioNet commands."""
+    if events and events != "ndjson":
+        _json_error(
+            "download",
+            "invalid_option",
+            f"Unsupported event format '{events}'.",
+            hint="Use: --events ndjson",
+        )
+    if events and not json_output:
+        _json_error(
+            "download",
+            "invalid_option",
+            "--events requires --json.",
+            hint="Use: m4 download DATASET --json --events ndjson",
+        )
+
+    reporter = NdjsonEventReporter(command="download") if events == "ndjson" else None
+    credentials = None
+    if physionet_credentials_file or physionet_credentials_stdin:
+        try:
+            credentials = _read_physionet_credentials(
+                physionet_credentials_file, physionet_credentials_stdin
+            )
+        except ValueError as exc:
+            result = CommandError(
+                command="download",
+                code="missing_credentials",
+                message=str(exc),
+            )
+            if reporter:
+                reporter.operation_failed(result.to_json_dict()["error"])
+            elif json_output:
+                _emit_command_json(result)
+            else:
+                print_error_panel("Download Failed", result.message, hint=result.hint)
+            raise typer.Exit(code=1)
+
+    if reporter:
+        reporter.operation_started(
+            dataset=dataset_name,
+            command_only=command_only,
+            credentials=bool(credentials),
+        )
+
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = download_dataset_service(
+            dataset_name,
+            target=target,
+            command_only=command_only,
+            physionet_credentials=credentials,
+            event_reporter=reporter,
+        )
+
+    if json_output:
+        if reporter:
+            if isinstance(result, CommandError):
+                reporter.operation_failed(result.to_json_dict()["error"])
+            else:
+                reporter.operation_completed(result.to_json_dict())
+        else:
+            _emit_command_json(result)
+        if isinstance(result, CommandError):
+            raise typer.Exit(code=1)
+        return
+
+    if isinstance(result, CommandError):
+        print_error_panel("Download Failed", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+
+    data = result.data
+    status = data.get("status")
+    if status == "completed":
+        success(f"Downloaded {data['dataset']} to {data['target']}")
+    elif status == "blocked":
+        warning(f"Credentialed dataset '{data['dataset']}' requires credentials")
+    else:
+        info(f"Download guidance for {data['dataset']}")
+
+    if data.get("wget_command"):
+        console.print()
+        print_command(data["wget_command"])
+    layout = data.get("layout", {})
+    if layout.get("warnings") or layout.get("errors"):
+        console.print()
+        warning("Layout validation reported issues")
+        for item in layout.get("errors", []):
+            console.print(f"  {item}")
+        for hint in layout.get("recovery", []):
+            console.print(f"  Hint: {hint}")
+
+
+class _ImageProgressLines(EventReporter):
+    """A line per image fetched or failed: a run can take hours."""
+
+    def __init__(self) -> None:
+        super().__init__(command="fetch-images", enabled=True)
+        self.done = 0
+        self.total = 0
+
+    def emit(self, event: str, **fields: Any) -> None:
+        if event == "download_started":
+            self.total = fields["file_count"]
+            info(f"{self.total} images; fetching those that are not on disk yet")
+        elif event in {"download_file_completed", "download_file_skipped"}:
+            self.done += 1
+            if event == "download_file_completed":
+                name = Path(fields["path"]).name
+                console.print(f"  [{self.done}/{self.total}] {name}")
+        elif event == "download_file_failed":
+            self.done += 1
+            name = Path(fields["path"]).name
+            warning(f"[{self.done}/{self.total}] {name}: {fields['code']}")
+
+
+@app.command("fetch-images")
+def fetch_images_cmd(
+    dataset_name: Annotated[
+        str,
+        typer.Argument(help="Imaging dataset to fetch images of, e.g. mimic-cxr-jpg."),
+    ],
+    from_csv: Annotated[
+        str,
+        typer.Option(
+            "--from-csv",
+            help=(
+                "CSV file naming the images: an image_path (or path) column, or "
+                "the dataset's image id column, such as dicom_id."
+            ),
+        ),
+    ],
+    target: Annotated[
+        str | None,
+        typer.Option(
+            "--target",
+            help="Raw folder of the dataset, if not M4's own (as for download).",
+        ),
+    ] = None,
+    max_images: Annotated[
+        int,
+        typer.Option(
+            "--max-images",
+            min=1,
+            help=(
+                "Refuse when more images than this are not on disk yet "
+                f"(default {MAX_IMAGES})."
+            ),
+        ),
+    ] = MAX_IMAGES,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON."),
+    ] = False,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            help="Emit structured progress events. Supported: ndjson.",
+        ),
+    ] = None,
+    physionet_credentials_file: Annotated[
+        str | None,
+        typer.Option(
+            "--physionet-credentials-file",
+            help="JSON file containing PhysioNet username and password fields.",
+        ),
+    ] = None,
+    physionet_credentials_stdin: Annotated[
+        bool,
+        typer.Option(
+            "--physionet-credentials-stdin",
+            help="Read the PhysioNet credentials JSON from standard input.",
+        ),
+    ] = False,
+):
+    """Download the image files of a cohort, never a whole imaging dataset."""
+    if events and events != "ndjson":
+        _json_error(
+            "fetch-images",
+            "invalid_option",
+            f"Unsupported event format '{events}'.",
+            hint="Use: --events ndjson",
+        )
+    if events and not json_output:
+        _json_error(
+            "fetch-images",
+            "invalid_option",
+            "--events requires --json.",
+            hint="Use: m4 fetch-images DATASET --from-csv FILE --json --events ndjson",
+        )
+
+    reporter = (
+        NdjsonEventReporter(command="fetch-images") if events == "ndjson" else None
+    )
+    credentials = None
+    if physionet_credentials_file or physionet_credentials_stdin:
+        try:
+            credentials = _read_physionet_credentials(
+                physionet_credentials_file, physionet_credentials_stdin
+            )
+        except ValueError as exc:
+            result = CommandError(
+                command="fetch-images", code="missing_credentials", message=str(exc)
+            )
+            if reporter:
+                reporter.operation_failed(result.to_json_dict()["error"])
+            elif json_output:
+                _emit_command_json(result)
+            else:
+                print_error_panel("Fetch Failed", result.message)
+            raise typer.Exit(code=1)
+
+    if reporter:
+        reporter.operation_started(dataset=dataset_name, credentials=bool(credentials))
+
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = fetch_images_service(
+            dataset_name,
+            from_csv=from_csv,
+            target=target,
+            physionet_credentials=credentials,
+            max_images=max_images,
+            event_reporter=reporter or (None if json_output else _ImageProgressLines()),
+        )
+
+    if json_output:
+        if reporter:
+            if isinstance(result, CommandError):
+                reporter.operation_failed(
+                    result.to_json_dict()["error"], data=result.data
+                )
+            else:
+                reporter.operation_completed(result.to_json_dict())
+        else:
+            _emit_command_json(result)
+        if isinstance(result, CommandError):
+            raise typer.Exit(code=1)
+        return
+
+    if isinstance(result, CommandError):
+        print_error_panel("Fetch Failed", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+    data = result.data
+    success(
+        f"Fetched {data['fetched']} images ({data['skipped']} were there already) "
+        f"into {data['root']}"
+    )
+
+
+@app.command("setup-agent")
+def setup_agent_cmd(
+    mode: Annotated[
+        str, typer.Option("--mode", help="Agent mode: local or protected.")
+    ] = "local",
+    client: Annotated[
+        str, typer.Option("--client", help="Client: claude or generic.")
+    ] = "generic",
+    dataset_name: Annotated[
+        str | None, typer.Option("--dataset", help="Default dataset.")
+    ] = None,
+    backend_name: Annotated[
+        str | None, typer.Option("--backend", help="Backend: duckdb or bigquery.")
+    ] = None,
+    project_id: Annotated[
+        str | None, typer.Option("--project-id", help="BigQuery billing project ID.")
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: json, dotenv, or text."),
+    ] = "text",
+    apply_config: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply dataset/backend/project configuration."),
+    ] = False,
+):
+    """Emit or apply agent environment and MCP client recommendations."""
+    if output_format not in {"json", "dotenv", "text"}:
+        _json_error(
+            "setup-agent",
+            "invalid_format",
+            f"Unsupported format '{output_format}'.",
+            "Use --format json, dotenv, or text.",
+        )
+    result = setup_agent_service(
+        mode=mode,
+        client=client,
+        dataset=dataset_name,
+        backend=backend_name,
+        project_id=project_id,
+        apply_config=apply_config,
+    )
+    if isinstance(result, CommandError):
+        if output_format == "json":
+            _emit_command_json(result)
+        else:
+            print_error_panel("Setup Agent Failed", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+
+    if output_format == "json":
+        _emit_command_json(result)
+        return
+    if output_format == "dotenv":
+        typer.echo("\n".join(_dotenv_lines(result.data["environment"])))
+        return
+
+    console.print("[bold]Agent environment[/bold]")
+    for line in _dotenv_lines(result.data["environment"]):
+        typer.echo(line)
+    console.print()
+    console.print("[bold]Recommended commands[/bold]")
+    for command in result.data["recommended_commands"]:
+        console.print(f"  [command]{command}[/command]")
+
+
+@app.command("quickstart")
+def quickstart_cmd(
+    workflow: Annotated[
+        str,
+        typer.Option("--workflow", help="Workflow: demo, local, or bigquery."),
+    ] = "demo",
+    dataset_name: Annotated[
+        str | None, typer.Option("--dataset", help="Dataset name.")
+    ] = None,
+    backend_name: Annotated[
+        str | None, typer.Option("--backend", help="Backend name.")
+    ] = None,
+    project_id: Annotated[
+        str | None, typer.Option("--project-id", help="BigQuery billing project ID.")
+    ] = None,
+    apply_config: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply the quickstart configuration."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON."),
+    ] = False,
+):
+    """Show or run the guided happy path for demo, local, or BigQuery use."""
+    result = quickstart_service(
+        workflow=workflow,
+        dataset=dataset_name,
+        backend=backend_name,
+        project_id=project_id,
+        apply_config=apply_config,
+    )
+    if json_output:
+        _emit_command_json(result)
+        if isinstance(result, CommandError):
+            raise typer.Exit(code=1)
+        return
+    if isinstance(result, CommandError):
+        print_error_panel("Quickstart Failed", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold]Quickstart: {result.data['workflow']}[/bold]")
+    for step in result.data["steps"]:
+        if "command" in step:
+            console.print(f"  [command]{step['command']}[/command]")
+    if result.warnings:
+        for item in result.warnings:
+            warning(item)
+
+
+@app.command("define-dataset")
+def define_dataset_cmd(
+    dataset_name: Annotated[
+        str,
+        typer.Argument(
+            help="Name of the new dataset: letters, digits, '.', '_' and '-'.",
+            metavar="NAME",
+        ),
+    ],
+    src: Annotated[
+        str,
+        typer.Option(
+            "--src",
+            help=(
+                "Folder of .csv or .csv.gz files: files directly in it, and in its "
+                "subfolders, each become a table."
+            ),
+        ),
+    ],
+    title: Annotated[
+        str | None,
+        typer.Option("--title", help="Display name. Default: NAME."),
+    ] = None,
+    summary: Annotated[
+        str | None,
+        typer.Option("--summary", help="One or two sentences on what it holds."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report the definition without saving it."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Replace a hand-written definition of the same name.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    include_paths: Annotated[
+        bool,
+        typer.Option("--paths", help="Include raw local filesystem paths."),
+    ] = False,
+):
+    """Define a dataset from a folder of your own CSV files.
+
+    Saves the definition in the datasets folder; `m4 init NAME --src DIR`
+    then converts the files.
+    """
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = define_dataset_service(
+            dataset_name,
+            src,
+            title=title,
+            summary=summary,
+            dry_run=dry_run,
+            force=force,
+        )
+
+    if json_output:
+        ctx = resolve_runtime_context(dataset=dataset_name.lower())
+        if isinstance(result, CommandError):
+            _emit_agent_error(
+                result.command,
+                result.code,
+                result.message,
+                hint=result.hint,
+                context=ctx.public_context(),
+            )
+        data = result.data
+        disclose = include_paths or _path_disclosure_enabled()
+        if not disclose:
+            data = {
+                **_hide_raw_paths(data, ctx.data_dir),
+                "init_command": f"m4 init {data['name']} --src <folder>",
+            }
+        _emit_json(
+            _agent_success_payload(
+                result.command,
+                {**data, "raw_paths_hidden": not disclose},
+                context=ctx.public_context(),
+                warnings=result.warnings,
+            )
+        )
+        return
+
+    if isinstance(result, CommandError):
+        print_error_panel("Cannot Define the Dataset", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+
+    data = result.data
+    verb = "Would define" if data["dry_run"] else "Defined"
+    success(
+        f"{verb} '{data['name']}': {data['table_count']} table(s) in "
+        f"{len(data['schemas'])} schema(s)"
+    )
+    for schema, count in data["schemas"].items():
+        console.print(f"  [muted]{schema}:[/muted] {count} table{'s' * (count != 1)}")
+    if not data["dry_run"]:
+        console.print(f"  [muted]Saved to[/muted] {data['definition_path']}")
+    console.print(f"  [muted]Next:[/muted] [command]{data['init_command']}[/command]")
+
+
+def _size_label(size: float) -> str:
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+@app.command("remove-dataset")
+def remove_dataset_cmd(
+    dataset_name: Annotated[
+        str,
+        typer.Argument(help="Dataset to remove.", metavar="NAME"),
+    ],
+    keep_definition: Annotated[
+        bool,
+        typer.Option(
+            "--keep-definition",
+            help="Keep the definition of a custom dataset; remove only its files.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report what would be removed, remove nothing."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    include_paths: Annotated[
+        bool,
+        typer.Option("--paths", help="Include raw local filesystem paths."),
+    ] = False,
+):
+    """Remove the files M4 made of a dataset, and a custom dataset's definition.
+
+    Only inside M4's data directory: the folder a dataset was initialized or
+    defined from stays. A database made with `m4 init --db-path` is recorded
+    nowhere, so it is not removed; delete it yourself.
+    """
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = remove_dataset_service(
+            dataset_name, keep_definition=keep_definition, dry_run=dry_run
+        )
+
+    if json_output:
+        ctx = resolve_runtime_context(dataset=dataset_name.lower())
+        disclose = include_paths or _path_disclosure_enabled()
+
+        def shown(data: dict[str, Any]) -> dict[str, Any]:
+            if not disclose:
+                data = _hide_raw_paths(data, ctx.data_dir)
+            return {**data, "raw_paths_hidden": not disclose}
+
+        if isinstance(result, CommandError):
+            _emit_agent_error(
+                result.command,
+                result.code,
+                result.message,
+                hint=result.hint,
+                context=ctx.public_context(),
+                data=shown(result.data) if result.data is not None else None,
+            )
+        _emit_json(
+            _agent_success_payload(
+                result.command, shown(result.data), context=ctx.public_context()
+            )
+        )
+        return
+
+    if isinstance(result, CommandError):
+        print_error_panel("Cannot Remove the Dataset", result.message, hint=result.hint)
+        raise typer.Exit(code=1)
+
+    data = result.data
+    verb = "Would remove" if data["dry_run"] else "Removed"
+    if not data["removed"]:
+        info(f"Nothing of '{data['name']}' to remove.")
+    for item in data["removed"]:
+        console.print(
+            f"  {verb} {item['path']} [muted]({_size_label(item['bytes'])})[/muted]"
+        )
+    for item in data["skipped"]:
+        warning(f"Kept {item['path']} ({item['reason'].replace('_', ' ')})")
+    if data["removed"]:
+        success(f"{verb} {_size_label(data['freed_bytes'])} of '{data['name']}'")
+
+
 @app.command("init")
 def dataset_init_cmd(
     dataset_name: Annotated[
@@ -122,7 +1138,7 @@ def dataset_init_cmd(
         typer.Option(
             "--src",
             help=(
-                "Path to existing raw CSV.gz root (hosp/, icu/). If provided, download is skipped."
+                "Path to existing raw CSV root (.csv.gz or .csv, e.g. hosp/, icu/). If provided, download is skipped."
             ),
         ),
     ] = None,
@@ -142,20 +1158,127 @@ def dataset_init_cmd(
             help="Force recreation of DuckDB even if it exists.",
         ),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print result as JSON for scripts and automation.",
+        ),
+    ] = False,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            help="Emit structured progress events. Supported: ndjson.",
+        ),
+    ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Accepted for automation; JSON init never prompts.",
+        ),
+    ] = False,
+    download_requested: Annotated[
+        bool,
+        typer.Option(
+            "--download",
+            help="Download missing raw files when a dataset listing URL is configured.",
+        ),
+    ] = False,
+    physionet_credentials_file: Annotated[
+        str | None,
+        typer.Option(
+            "--physionet-credentials-file",
+            help="JSON file containing PhysioNet username and password fields.",
+        ),
+    ] = None,
+    physionet_credentials_stdin: Annotated[
+        bool,
+        typer.Option(
+            "--physionet-credentials-stdin",
+            help="Read the PhysioNet credentials JSON from standard input.",
+        ),
+    ] = False,
 ):
     """
     Initialize a local dataset in one step by detecting what's already present:
-    - If Parquet exists: only initialize DuckDB views
-    - If raw CSV.gz exists but Parquet is missing: convert then initialize
+    - If raw CSV.gz exists: convert the files that have no Parquet file yet, then initialize DuckDB views
+    - If only Parquet exists: only initialize DuckDB views
     - If neither exists: download (demo only), convert, then initialize
+
+    Running it again finishes an initialization that was interrupted.
 
     Notes:
     - Auto-download is based on the dataset definition URL.
     - For datasets without a download URL (e.g. mimic-iv-full), you must provide the --src path or place files in the expected location.
     """
+    if events and events != "ndjson":
+        _json_error(
+            "init",
+            "invalid_option",
+            f"Unsupported event format '{events}'.",
+            hint="Use: --events ndjson",
+        )
+    if events and not json_output:
+        _json_error(
+            "init",
+            "invalid_option",
+            "--events requires --json.",
+            hint="Use: m4 init DATASET --json --events ndjson",
+        )
+
+    if json_output:
+        reporter = NdjsonEventReporter(command="init") if events == "ndjson" else None
+        credentials = None
+        if physionet_credentials_file or physionet_credentials_stdin:
+            try:
+                credentials = _read_physionet_credentials(
+                    physionet_credentials_file, physionet_credentials_stdin
+                )
+            except ValueError as exc:
+                result = CommandError(
+                    command="init",
+                    code="missing_credentials",
+                    message=str(exc),
+                )
+                if reporter:
+                    reporter.operation_failed(result.to_json_dict()["error"])
+                else:
+                    _emit_command_json(result)
+                raise typer.Exit(code=1)
+
+        if reporter:
+            reporter.operation_started(
+                dataset=dataset_name,
+                download=download_requested,
+                no_interactive=no_interactive,
+            )
+        with _silence_m4_logging():
+            result = initialize_dataset_service(
+                dataset_name,
+                src=src,
+                db_path_str=db_path_str,
+                force=force,
+                download=download_requested,
+                physionet_credentials=credentials,
+                event_reporter=reporter,
+            )
+        if reporter:
+            if isinstance(result, CommandError):
+                reporter.operation_failed(result.to_json_dict()["error"])
+            else:
+                reporter.operation_completed(result.to_json_dict())
+        else:
+            _emit_command_json(result)
+        if isinstance(result, CommandError):
+            raise typer.Exit(code=1)
+        return
+
     logger.info(f"CLI 'init' called for dataset: '{dataset_name}'")
 
     dataset_key = dataset_name.lower()
+    ensure_custom_datasets_loaded()
     ds = DatasetRegistry.get(dataset_key)
     if not ds:
         supported = ", ".join([d.name for d in DatasetRegistry.list_all()])
@@ -165,6 +1288,18 @@ def dataset_init_cmd(
             hint=f"Supported datasets: {supported}",
         )
         raise typer.Exit(code=1)
+
+    # A login given here downloads a credentialed dataset, as it does with
+    # --json; without one, the steps to download it by hand are shown.
+    credentials = None
+    if physionet_credentials_file or physionet_credentials_stdin:
+        try:
+            credentials = _read_physionet_credentials(
+                physionet_credentials_file, physionet_credentials_stdin
+            )
+        except ValueError as exc:
+            print_error_panel("Cannot Read the PhysioNet Login", str(exc))
+            raise typer.Exit(code=1)
 
     # Check if m4_data exists in a parent directory
     from m4.config import _find_project_root_from_cwd
@@ -206,7 +1341,7 @@ def dataset_init_cmd(
 
     # Presence detection (check for any parquet or csv.gz files)
     parquet_present = any(pq_root.rglob("*.parquet"))
-    raw_present = any(csv_root.rglob("*.csv.gz"))
+    raw_present = has_raw_files(csv_root)
 
     console.print()
     print_banner(f"Initializing {dataset_key}", "Checking existing files...")
@@ -219,11 +1354,22 @@ def dataset_init_cmd(
         f"{pq_root} [{'[success]found[/]' if parquet_present else '[muted]missing[/]'}]",
     )
 
+    # A download into M4's own raw folder that was cut short is finished before
+    # anything is made of the files that did arrive. That needs no login for an
+    # open dataset; for a credentialed one, the check below says what to run.
+    resume_download = bool(
+        raw_present
+        and not src
+        and unfinished_download(csv_root)
+        and (not ds.requires_authentication or credentials is not None)
+        and ds.file_listing_url
+    )
+
     # Step 1: Ensure raw dataset exists (download if missing, for requires_authentication datasets, inform and return)
-    if not raw_present and not parquet_present:
+    if resume_download or (not raw_present and not parquet_present):
         requires_auth = ds.requires_authentication
 
-        if requires_auth:
+        if requires_auth and credentials is None:
             base_url = ds.file_listing_url
 
             console.print()
@@ -233,15 +1379,20 @@ def dataset_init_cmd(
             console.print(
                 f"  [bold]1.[/bold] Sign the DUA at: [link]{base_url or 'https://physionet.org'}[/link]"
             )
-            console.print(
-                "  [bold]2.[/bold] Run this command (you'll be prompted for your PhysioNet password):"
-            )
-            console.print()
-
-            # Wget command tailored to the user's path
-            wget_cmd = f"wget -r -N -c -np --user YOUR_USERNAME --ask-password {base_url} -P {csv_root}"
-            print_command(wget_cmd)
-            console.print()
+            # Wget command tailored to the user's path. There is none for a
+            # dataset that PhysioNet does not serve.
+            wget_cmd = build_wget_command(ds, csv_root)
+            if wget_cmd:
+                console.print(
+                    "  [bold]2.[/bold] Run this command (you'll be prompted for your PhysioNet password):"
+                )
+                console.print()
+                print_command(wget_cmd)
+                console.print()
+            else:
+                console.print(
+                    f"  [bold]2.[/bold] Download its CSV.gz files and place them under: [path]{csv_root}[/path]"
+                )
             console.print(
                 f"  [bold]3.[/bold] Re-run: [command]m4 init {dataset_key}[/command]"
             )
@@ -257,7 +1408,11 @@ def dataset_init_cmd(
             print_key_value("Source", listing_url)
             print_key_value("Destination", out_dir)
 
-            ok = download_dataset(dataset_key, out_dir)
+            try:
+                ok = download_dataset(dataset_key, out_dir, credentials=credentials)
+            except DatasetDownloadError as exc:
+                error(f"Download failed: {exc.message}")
+                raise typer.Exit(code=1)
             if not ok:
                 error("Download failed. Please check logs for details.")
                 raise typer.Exit(code=1)
@@ -281,17 +1436,43 @@ def dataset_init_cmd(
             )
             return
 
-    # Step 2: Ensure Parquet exists (convert if missing)
-    if not parquet_present:
+    problem = source_problem(
+        ds, csv_root, pq_root, raw_present=raw_present, src_given=bool(src)
+    )
+    if problem:
         console.print()
-        print_step(2, 3, "Converting CSV to Parquet")
-        print_key_value("Source", csv_root)
-        print_key_value("Destination", pq_root)
-        ok = convert_csv_to_parquet(dataset_key, csv_root, pq_root)
+        print_error_panel("Cannot Initialize", problem.message, hint=problem.hint)
+        raise typer.Exit(code=1)
+
+    # Step 2: Convert every raw file that has no finished Parquet file yet
+    if raw_present:
+        to_convert = find_unconverted(csv_root, pq_root)
+        if to_convert:
+            console.print()
+            print_step(2, 3, "Converting CSV to Parquet")
+            print_key_value("Source", csv_root)
+            print_key_value("Destination", pq_root)
+        conversion_warnings: list[dict[str, Any]] = []
+        try:
+            ok = convert_csv_to_parquet(
+                dataset_key, csv_root, pq_root, warnings=conversion_warnings
+            )
+        except CsvConversionError as exc:
+            print_error_panel("Conversion Failed", exc.message, hint=exc.hint)
+            raise typer.Exit(code=1)
         if not ok:
             error("Conversion failed. Please check logs for details.")
             raise typer.Exit(code=1)
-        success("Conversion complete")
+        for note in conversion_warnings:
+            if note["code"] == WARNING_CSV_READ_AS_LATIN1:
+                warning(f"{note['file']} is not UTF-8; it was read as Latin-1.")
+            elif note["code"] == WARNING_DECIMAL_COMMA_COLUMNS:
+                warning(
+                    f"{note['file']}: {', '.join(note['columns'])} hold decimal "
+                    "commas and were kept as text."
+                )
+        if to_convert:
+            success("Conversion complete")
 
     # Step 3: Initialize DuckDB over Parquet
     final_db_path = (
@@ -334,26 +1515,33 @@ def dataset_init_cmd(
     )
 
     verification_table_name = ds.primary_verification_table
+    verified = True
     if not verification_table_name:
         logger.warning(
             f"No 'primary_verification_table' configured for '{dataset_name}'. Skipping DB query test."
         )
-        print_init_complete(dataset_name, str(final_db_path), str(pq_root))
     else:
         try:
             record_count = verify_table_rowcount(final_db_path, verification_table_name)
             success(
                 f"Verified: {record_count:,} records in '{verification_table_name}'"
             )
-            print_init_complete(dataset_name, str(final_db_path), str(pq_root))
         except Exception as e:
             logger.error(
                 f"Unexpected error during database verification: {e}", exc_info=True
             )
             error(f"Verification failed: {e}")
+            verified = False
 
-    # Set active dataset to match init target
-    set_active_dataset(dataset_key)
+    if verified:
+        # Every raw file has its table and the views answer: only now is the
+        # dataset reported as ready.
+        try:
+            mark_dataset_prepared(pq_root, final_db_path)
+        except OSError as e:
+            error(f"Could not record that '{dataset_name}' is ready: {e}")
+            raise typer.Exit(code=1)
+        print_init_complete(dataset_name, str(final_db_path), str(pq_root))
 
     # Offer to materialize derived tables for supported datasets
     if has_derived_support(dataset_key) and get_active_backend() == "duckdb":
@@ -428,6 +1616,20 @@ def init_derived_cmd(
             help="Force re-materialization even if derived tables already exist.",
         ),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print result as JSON for scripts and automation.",
+        ),
+    ] = False,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            help="Emit structured progress events. Supported: ndjson.",
+        ),
+    ] = None,
 ):
     """Materialize built-in derived tables for a dataset.
 
@@ -437,151 +1639,119 @@ def init_derived_cmd(
 
     On BigQuery, derived tables already exist — no materialization needed.
     """
-    dataset_key = dataset_name.lower()
-    ds = DatasetRegistry.get(dataset_key)
-
-    if not ds:
-        supported = ", ".join([d.name for d in DatasetRegistry.list_all()])
-        print_error_panel(
-            "Dataset Not Found",
-            f"Dataset '{dataset_name}' is not supported or not configured.",
-            hint=f"Supported datasets: {supported}",
+    if events and events != "ndjson":
+        _json_error(
+            "init-derived",
+            "invalid_option",
+            f"Unsupported event format '{events}'.",
+            hint="Use: --events ndjson",
         )
+    if events and not json_output:
+        _json_error(
+            "init-derived",
+            "invalid_option",
+            "--events requires --json.",
+            hint="Use: m4 init-derived DATASET --json --events ndjson",
+        )
+
+    reporter = (
+        NdjsonEventReporter(command="init-derived")
+        if json_output and events == "ndjson"
+        else None
+    )
+    if reporter:
+        reporter.operation_started(
+            dataset=dataset_name,
+            list_only=list_only,
+            force=force,
+        )
+
+    with (
+        _silence_m4_logging() if json_output else nullcontext(),
+        _silence_console_output() if json_output else nullcontext(),
+    ):
+        result = init_derived_service(
+            dataset_name,
+            list_only=list_only,
+            force=force,
+            event_reporter=reporter,
+        )
+
+    if json_output:
+        if reporter:
+            if isinstance(result, CommandError):
+                reporter.operation_failed(result.to_json_dict()["error"])
+            else:
+                reporter.operation_completed(result.to_json_dict())
+        else:
+            _emit_command_json(result)
+        if isinstance(result, CommandError):
+            raise typer.Exit(code=1)
+        return
+
+    if isinstance(result, CommandError):
+        title = {
+            "dataset_not_found": "Dataset Not Found",
+            "derived_not_supported": "Not Supported",
+            "database_not_found": "Database Not Found",
+            "derived_materialization_failed": "Materialization Failed",
+        }.get(result.code, "Init Derived Failed")
+        if result.hint:
+            print_error_panel(title, result.message, hint=result.hint)
+        else:
+            error(result.message)
         raise typer.Exit(code=1)
 
-    # Block unsupported datasets
-    if dataset_key in ("mimic-iv-demo",):
-        print_error_panel(
-            "Not Supported",
-            f"Derived tables are not supported for '{dataset_key}'.",
-            hint=(
-                "The demo dataset has only 100 patients; many derived concepts "
-                "produce empty or unreliable results. Use the full mimic-iv dataset."
-            ),
-        )
-        raise typer.Exit(code=1)
-
-    # Block if BigQuery backend
-    if get_active_backend() == "bigquery":
+    data = result.data
+    status = data.get("status")
+    if status == "listed":
+        console.print(f"\n[bold]Available derived tables for {data['dataset']}:[/bold]")
+        console.print(f"[muted]({data['table_count']} tables)[/muted]\n")
+        for name in data["tables"]:
+            console.print(f"  {name}")
+    elif (
+        status == "skipped"
+        and data.get("reason") == "bigquery_derived_tables_available"
+    ):
         info(
             "BigQuery backend active — built-in derived tables are already available "
             "on physionet-data.mimiciv_derived. No materialization needed."
         )
-        return
-
-    if list_only:
-        try:
-            names = list_builtins(dataset_key)
-            console.print(f"\n[bold]Available derived tables for {dataset_key}:[/bold]")
-            console.print(f"[muted]({len(names)} tables)[/muted]\n")
-            for name in names:
-                console.print(f"  {name}")
-        except ValueError as e:
-            error(str(e))
-            raise typer.Exit(code=1)
-        return
-
-    db_path = get_default_database_path(dataset_key)
-    if not db_path or not db_path.exists():
-        print_error_panel(
-            "Database Not Found",
-            f"No DuckDB database found for '{dataset_key}'.",
-            hint=f"Initialize first: m4 init {dataset_key}",
-        )
-        raise typer.Exit(code=1)
-
-    # Skip if derived tables already exist (unless --force)
-    existing_count = get_derived_table_count(db_path)
-    if existing_count > 0 and not force:
+    elif status == "skipped" and data.get("reason") == "already_materialized":
         info(
-            f"Derived tables already materialized ({existing_count} tables). "
+            f"Derived tables already materialized ({data['existing_table_count']} tables). "
             "Use --force to recreate."
         )
-        return
-
-    try:
-        created = materialize_all(dataset_key, db_path)
-        success(f"Created {len(created)} derived tables in mimiciv_derived schema")
-    except ValueError as e:
-        error(str(e))
-        raise typer.Exit(code=1)
-    except RuntimeError as e:
-        if "locked by another process" in str(e):
-            print_error_panel(
-                "Database Locked",
-                str(e),
-                hint="If the M4 MCP server is running, stop it before "
-                "materializing derived tables.",
-            )
-        else:
-            error(f"Materialization failed: {e}")
-            logger.error(f"Derived table materialization error: {e}", exc_info=True)
-        raise typer.Exit(code=1)
-    except Exception as e:
-        error(f"Materialization failed: {e}")
-        logger.error(f"Derived table materialization error: {e}", exc_info=True)
-        raise typer.Exit(code=1)
+    elif status == "completed":
+        success(
+            f"Created {data['table_count']} derived tables in mimiciv_derived schema"
+        )
 
 
 @app.command("use")
 def use_cmd(
     target: Annotated[
         str,
-        typer.Argument(
-            help="Select active dataset: name (e.g., mimic-iv-full)", metavar="TARGET"
-        ),
+        typer.Argument(help="Deprecated global dataset selector.", metavar="TARGET"),
     ],
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print result as JSON for scripts and automation.",
+        ),
+    ] = False,
 ):
-    """Set the active dataset selection for the project."""
-    target = target.lower()
+    """Deprecated: global active dataset selection has been removed."""
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = set_active_dataset_service(target)
 
-    # 1. Check if dataset is registered
-    availability = detect_available_local_datasets().get(target)
-
-    if not availability:
-        supported = ", ".join([ds.name for ds in DatasetRegistry.list_all()])
-        print_error_panel(
-            "Dataset Not Found",
-            f"Dataset '{target}' not found or not registered.",
-            hint=f"Supported datasets: {supported}",
-        )
+    if json_output:
+        _emit_command_json(result)
         raise typer.Exit(code=1)
 
-    # 2. Block if dataset is incompatible with current backend
-    ds_def = DatasetRegistry.get(target)
-    backend_name = get_active_backend()
-
-    if ds_def and not ds_def.bigquery_dataset_ids and backend_name == "bigquery":
-        print_error_panel(
-            "Backend Incompatible",
-            f"Dataset '{target}' is not available on the BigQuery backend.",
-            hint="Switch to DuckDB first: m4 backend duckdb",
-        )
-        raise typer.Exit(code=1)
-
-    # 3. Set it active
-    set_active_dataset(target)
-    success(f"Active dataset set to '{target}'")
-
-    # 4. Warn if local files are missing (helpful info, not a blocker)
-    if not availability["parquet_present"]:
-        warning(f"Local Parquet files not found at {availability['parquet_root']}")
-        console.print(
-            "  [muted]This is fine if you are using the BigQuery backend.[/muted]"
-        )
-        console.print(
-            "  [muted]For DuckDB (local), run:[/muted] [command]m4 init[/command]"
-        )
-    else:
-        info("Local: Available", prefix="status")
-
-    # 5. Show BigQuery status
-    if ds_def:
-        if ds_def.bigquery_dataset_ids:
-            info(
-                f"BigQuery: Available (Project: {ds_def.bigquery_project_id})",
-                prefix="status",
-            )
+    print_error_panel("Active Dataset Removed", result.message, hint=result.hint)
+    raise typer.Exit(code=1)
 
 
 @app.command("backend")
@@ -597,55 +1767,39 @@ def backend_cmd(
             help="Google Cloud project ID for billing (bigquery only)",
         ),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print result as JSON for scripts and automation.",
+        ),
+    ] = False,
 ):
     """Set the active backend (duckdb or bigquery)."""
-    target = target.lower()
+    with _silence_m4_logging() if json_output else nullcontext():
+        result = set_active_backend_service(target, project_id=project_id)
 
-    if target not in VALID_BACKENDS:
-        print_error_panel(
-            "Invalid Backend",
-            f"Backend '{target}' is not valid.",
-            hint=f"Valid backends: {', '.join(sorted(VALID_BACKENDS))}",
-        )
-        raise typer.Exit(code=1)
-
-    # Reject --project-id for duckdb
-    if target == "duckdb" and project_id:
-        error("--project-id can only be used with bigquery backend")
-        raise typer.Exit(code=1)
-
-    # Block if current dataset is incompatible with new backend
-    if target == "bigquery":
-        try:
-            active = get_active_dataset()
-            ds_def = DatasetRegistry.get(active)
-            if ds_def and not ds_def.bigquery_dataset_ids:
-                print_error_panel(
-                    "Dataset Incompatible",
-                    f"Current dataset '{active}' is not available on BigQuery.",
-                    hint="Switch dataset first: m4 use <dataset>",
-                )
-                raise typer.Exit(code=1)
-        except (ValueError, DatasetError):
-            pass  # No active dataset set
-
-    # BigQuery requires a project ID — either provided now or already in config
-    if target == "bigquery":
-        effective_project_id = project_id or get_bigquery_project_id()
-        if not effective_project_id:
-            print_error_panel(
-                "Project ID Required",
-                "BigQuery backend requires a project ID.",
-                hint="Set it with: m4 backend bigquery --project-id <ID>",
-            )
+    if isinstance(result, CommandError):
+        if json_output:
+            _emit_command_json(result)
             raise typer.Exit(code=1)
 
-    set_active_backend(target)
+        if result.code == "invalid_option":
+            error(result.message.removesuffix("."))
+        else:
+            title = {
+                "invalid_backend": "Invalid Backend",
+                "dataset_incompatible": "Dataset Incompatible",
+                "project_id_required": "Project ID Required",
+            }.get(result.code, "Command Failed")
+            print_error_panel(title, result.message, hint=result.hint)
+        raise typer.Exit(code=1)
 
-    # Persist project ID if provided
-    if project_id:
-        set_bigquery_project_id(project_id)
+    if json_output:
+        _emit_command_json(result)
+        return
 
+    target = result.data["backend"]
     success(f"Active backend set to '{target}'")
 
     # Show helpful context
@@ -680,23 +1834,79 @@ def status_cmd(
             help="Show detailed derived table status grouped by category.",
         ),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print status as JSON for scripts and automation.",
+        ),
+    ] = False,
+    dataset_name: Annotated[
+        str | None,
+        typer.Option(
+            "--dataset",
+            help="Dataset to inspect without changing active config.",
+        ),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option(
+            "--backend",
+            help="Backend to inspect without changing active config.",
+        ),
+    ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--no-interactive",
+            help="Accepted for automation; status never prompts.",
+        ),
+    ] = False,
+    include_paths: Annotated[
+        bool,
+        typer.Option(
+            "--paths",
+            help="Include raw local filesystem paths in output.",
+        ),
+    ] = False,
 ):
-    """Show active dataset status. Use --all for all supported datasets."""
+    """Show dataset status. Use --dataset for one dataset or --all for all."""
+    if show_derived and json_output:
+        _json_error(
+            "status",
+            "invalid_option",
+            "--json cannot be combined with --derived.",
+            hint="Run either: m4 status --json or m4 status --derived",
+        )
+
+    if json_output:
+        with (
+            _silence_m4_logging(),
+            _runtime_env_override(dataset=dataset_name, backend=backend_name),
+        ):
+            snapshot = collect_status_snapshot(
+                show_all=show_all,
+                include_paths=include_paths,
+                selected_dataset=dataset_name,
+                backend=backend_name,
+            )
+        _emit_json(snapshot)
+        return
 
     # --derived: detailed per-table view (early return)
     if show_derived:
-        active = get_active_dataset()
-        if not active:
-            console.print("[warning]No active dataset set.[/warning]")
+        selected = dataset_name.lower() if dataset_name else None
+        if not selected:
+            console.print("[warning]--dataset is required for --derived.[/warning]")
             raise typer.Exit()
 
-        if not has_derived_support(active):
+        if not has_derived_support(selected):
             console.print(
-                f"[muted]Derived tables are not available for '{active}'.[/muted]"
+                f"[muted]Derived tables are not available for '{selected}'.[/muted]"
             )
             raise typer.Exit()
 
-        backend = get_active_backend()
+        backend = (backend_name or get_active_backend()).lower()
         if backend == "bigquery":
             info(
                 "BigQuery backend active — derived tables are available "
@@ -704,162 +1914,520 @@ def status_cmd(
             )
             raise typer.Exit()
 
-        db_path = get_default_database_path(active)
+        db_path = get_default_database_path(selected)
         if not db_path or not db_path.exists():
             console.print(
-                f"[warning]No DuckDB database found for '{active}'.[/warning]"
+                f"[warning]No DuckDB database found for '{selected}'.[/warning]"
             )
             console.print(
-                f"  [muted]Initialize with:[/muted] [command]m4 init {active}[/command]"
+                f"  [muted]Initialize with:[/muted] [command]m4 init {selected}[/command]"
             )
             raise typer.Exit()
 
-        categories = get_tables_by_category(active)
+        categories = get_tables_by_category(selected)
         materialized = list_materialized_tables(db_path)
-        print_derived_detail(active, categories, materialized)
+        print_derived_detail(selected, categories, materialized)
         return
 
     print_logo(show_tagline=False, show_version=True)
     console.print()
 
-    active = get_active_dataset()
-    availability = detect_available_local_datasets()
+    with _runtime_env_override(dataset=dataset_name, backend=backend_name):
+        snapshot = collect_status_snapshot(
+            show_all=show_all,
+            include_paths=include_paths,
+            selected_dataset=dataset_name,
+            backend=backend_name,
+        )
+    selected = snapshot["selected_dataset"]
+    datasets = snapshot["datasets"]
 
     if show_all:
         # Table view of all datasets
-        if not availability:
+        if not datasets:
             console.print("[muted]No datasets detected.[/muted]")
             return
 
         # Build dataset info list for table
-        datasets_info = []
-        for label, ds_info in availability.items():
-            ds_def = DatasetRegistry.get(label)
-            bigquery_available = bool(ds_def and ds_def.bigquery_dataset_ids)
+        datasets_info = [
+            {
+                "name": dataset["name"],
+                "parquet_present": dataset["parquet_present"],
+                "db_present": dataset["db_present"],
+                "prepared": dataset["prepared"],
+                "bigquery_available": dataset["bigquery_available"],
+                "parquet_size_gb": dataset["parquet_size_gb"],
+                "derived_materialized": dataset["derived"]["materialized"],
+                "derived_total": dataset["derived"]["total"],
+            }
+            for dataset in datasets
+        ]
 
-            # Get size if parquet present
-            parquet_size_gb = None
-            if ds_info["parquet_present"]:
-                try:
-                    size_bytes = compute_parquet_dir_size(Path(ds_info["parquet_root"]))
-                    parquet_size_gb = float(size_bytes) / (1024**3)
-                except Exception:
-                    pass
-
-            # Get derived counts if supported and db present
-            derived_materialized = None
-            derived_total = None
-            if has_derived_support(label) and ds_info["db_present"]:
-                try:
-                    derived_total = len(list_builtins(label))
-                    derived_materialized = get_derived_table_count(
-                        Path(ds_info["db_path"])
-                    )
-                except Exception:
-                    pass
-
-            datasets_info.append(
-                {
-                    "name": label,
-                    "parquet_present": ds_info["parquet_present"],
-                    "db_present": ds_info["db_present"],
-                    "bigquery_available": bigquery_available,
-                    "parquet_size_gb": parquet_size_gb,
-                    "derived_materialized": derived_materialized,
-                    "derived_total": derived_total,
-                }
-            )
-
-        print_datasets_table(datasets_info, active_dataset=active)
+        print_datasets_table(datasets_info, selected_dataset=selected)
         return
 
-    # Default: show only active dataset with full detail
-    if not active:
-        console.print("[warning]No active dataset set.[/warning]")
+    if not selected:
+        console.print("[warning]No dataset selected.[/warning]")
         console.print()
         console.print(
-            "[muted]Set one with:[/muted] [command]m4 use <dataset>[/command]"
+            "[muted]Use:[/muted] [command]m4 status --dataset <dataset>[/command]"
         )
         console.print(
             "[muted]List all with:[/muted] [command]m4 status --all[/command]"
         )
         return
 
-    console.print(f"[bold]Active dataset:[/bold] [success]{active}[/success]")
+    console.print(f"[bold]Dataset:[/bold] [success]{selected}[/success]")
 
-    backend = get_active_backend()
+    backend = snapshot["backend"]
     backend_label = backend
-    if backend == "bigquery":
-        bq_project = get_bigquery_project_id()
-        if bq_project:
-            backend_label = f"{backend} ({bq_project})"
+    if backend == "bigquery" and snapshot["bigquery_project_id"]:
+        backend_label = f"{backend} ({snapshot['bigquery_project_id']})"
     console.print(f"[bold]Backend:[/bold] [success]{backend_label}[/success]")
 
-    # Get info for active dataset
-    ds_info = availability.get(active)
-    if not ds_info:
+    # Get info for selected dataset
+    dataset = datasets[0] if datasets else None
+    if not dataset:
         console.print()
-        warning(f"Dataset '{active}' is set but not found locally.")
+        warning(f"Dataset '{selected}' was not found locally.")
         console.print(
-            f"  [muted]Initialize with:[/muted] [command]m4 init {active}[/command]"
+            f"  [muted]Initialize with:[/muted] [command]m4 init {selected}[/command]"
         )
         return
 
-    # Get size if parquet present
-    parquet_size_gb = None
-    if ds_info["parquet_present"]:
-        try:
-            size_bytes = compute_parquet_dir_size(Path(ds_info["parquet_root"]))
-            parquet_size_gb = float(size_bytes) / (1024**3)
-        except Exception:
-            pass
-
-    # Get dataset definition for BigQuery status and verification
-    ds_def = DatasetRegistry.get(active)
-    bigquery_available = bool(ds_def and ds_def.bigquery_dataset_ids)
-
-    # Get row count if possible
-    row_count = None
-    if ds_info["db_present"] and ds_def and ds_def.primary_verification_table:
-        try:
-            row_count = verify_table_rowcount(
-                Path(ds_info["db_path"]), ds_def.primary_verification_table
-            )
-        except Exception as e:
-            # Show hint if it looks like a path mismatch
-            if "No files found" in str(e) or "no such file" in str(e).lower():
-                warning("Database views may point to wrong parquet location")
-                console.print(
-                    f"  [muted]Try:[/muted] [command]m4 init {active} --force[/command]"
-                )
-
-    # Gather derived table info
-    derived_has_support = has_derived_support(active)
-    derived_is_bigquery = bigquery_available and backend == "bigquery"
-    derived_materialized = None
-    derived_total = None
-    if derived_has_support and not derived_is_bigquery and ds_info["db_present"]:
-        try:
-            derived_total = len(list_builtins(active))
-            derived_materialized = get_derived_table_count(Path(ds_info["db_path"]))
-        except Exception:
-            pass
+    if "parquet_path_mismatch" in dataset["warnings"]:
+        warning("Database views may point to wrong parquet location")
+        console.print(
+            f"  [muted]Try:[/muted] [command]m4 init {selected} --force[/command]"
+        )
 
     print_dataset_status(
-        name=active,
-        parquet_present=ds_info["parquet_present"],
-        db_present=ds_info["db_present"],
-        parquet_root=str(ds_info["parquet_root"]),
-        db_path=str(ds_info["db_path"]),
-        parquet_size_gb=parquet_size_gb,
-        bigquery_available=bigquery_available,
-        row_count=row_count,
-        is_active=True,
-        derived_materialized=derived_materialized,
-        derived_total=derived_total,
-        derived_has_support=derived_has_support,
-        derived_is_bigquery=derived_is_bigquery,
+        name=selected,
+        parquet_present=dataset["parquet_present"],
+        db_present=dataset["db_present"],
+        prepared=dataset["prepared"],
+        parquet_root=dataset.get("parquet_root") or "",
+        db_path=dataset.get("db_path") or "",
+        parquet_size_gb=dataset["parquet_size_gb"],
+        bigquery_available=dataset["bigquery_available"],
+        row_count=dataset["row_count"],
+        is_selected=True,
+        derived_materialized=dataset["derived"]["materialized"],
+        derived_total=dataset["derived"]["total"],
+        derived_has_support=dataset["derived"]["supported"],
+        derived_is_bigquery=dataset["derived"]["bigquery"],
     )
+
+
+@app.command("list-datasets")
+def list_datasets_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    dataset_name: Annotated[
+        str | None,
+        typer.Option("--dataset", help="Dataset to mark as active in this result."),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option("--backend", help="Backend to use for compatibility checks."),
+    ] = None,
+    no_interactive: Annotated[
+        bool,
+        typer.Option("--no-interactive", help="Accepted for automation."),
+    ] = False,
+    include_paths: Annotated[
+        bool,
+        typer.Option("--paths", help="Include raw local filesystem paths."),
+    ] = False,
+):
+    """List available datasets without mutating active config."""
+    with _silence_m4_logging() if json_output else nullcontext():
+        with _runtime_env_override(dataset=dataset_name, backend=backend_name):
+            ctx = resolve_runtime_context(
+                dataset=dataset_name,
+                backend=backend_name,
+                path_disclosure=include_paths,
+            )
+            snapshot = collect_status_snapshot(
+                show_all=True,
+                include_paths=include_paths,
+                selected_dataset=dataset_name,
+                backend=backend_name,
+            )
+
+    if json_output:
+        _emit_json(
+            _agent_success_payload(
+                "list-datasets",
+                {
+                    "selected_dataset": snapshot["selected_dataset"],
+                    "backend": snapshot["backend"],
+                    "datasets": snapshot["datasets"],
+                    "raw_paths_hidden": not include_paths,
+                },
+                context=ctx.public_context(),
+            )
+        )
+        return
+
+    datasets_info = [
+        {
+            "name": dataset["name"],
+            "parquet_present": dataset["parquet_present"],
+            "db_present": dataset["db_present"],
+            "prepared": dataset["prepared"],
+            "bigquery_available": dataset["bigquery_available"],
+            "parquet_size_gb": dataset["parquet_size_gb"],
+            "derived_materialized": dataset["derived"]["materialized"],
+            "derived_total": dataset["derived"]["total"],
+        }
+        for dataset in snapshot["datasets"]
+    ]
+    print_datasets_table(datasets_info, selected_dataset=snapshot["selected_dataset"])
+
+
+@app.command("schema")
+def schema_cmd(
+    dataset_name: Annotated[
+        str | None,
+        typer.Option("--dataset", help="Dataset to inspect."),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option("--backend", help="Backend to use."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    no_interactive: Annotated[
+        bool,
+        typer.Option("--no-interactive", help="Accepted for automation."),
+    ] = False,
+):
+    """List tables for a dataset/backend pair without mutating active config."""
+    command = "schema"
+    init_tools()
+    ctx = resolve_runtime_context(dataset=dataset_name, backend=backend_name)
+    with _silence_m4_logging() if json_output else nullcontext():
+        try:
+            client = M4Client(
+                dataset=dataset_name,
+                backend=backend_name,
+                interface="cli",
+                project_id=ctx.project_id,
+                path_disclosure=ctx.path_disclosure,
+            )
+            result = client.schema()
+            ctx_public = client.context.public_context()
+        except M4Error as exc:
+            if json_output:
+                _emit_agent_error(
+                    command,
+                    "schema_failed",
+                    str(exc),
+                    context=ctx.public_context(),
+                )
+            error(str(exc))
+            raise typer.Exit(code=1)
+
+    if json_output:
+        _emit_json(
+            _agent_success_payload(
+                command,
+                {"tables": result.get("tables", [])},
+                context=ctx_public,
+            )
+        )
+        return
+
+    for table in result.get("tables", []):
+        typer.echo(table)
+
+
+@app.command("describe-table")
+def describe_table_cmd(
+    table_name: Annotated[
+        str,
+        typer.Argument(
+            help="Table name to inspect, for example mimiciv_hosp.admissions."
+        ),
+    ],
+    dataset_name: Annotated[
+        str | None,
+        typer.Option("--dataset", help="Dataset to inspect."),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option("--backend", help="Backend to use."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    no_interactive: Annotated[
+        bool,
+        typer.Option("--no-interactive", help="Accepted for automation."),
+    ] = False,
+    show_sample: Annotated[
+        bool,
+        typer.Option("--sample/--no-sample", help="Include up to three sample rows."),
+    ] = True,
+):
+    """Describe a single table without mutating active config."""
+    command = "describe-table"
+    init_tools()
+    ctx = resolve_runtime_context(dataset=dataset_name, backend=backend_name)
+    with _silence_m4_logging() if json_output else nullcontext():
+        try:
+            client = M4Client(
+                dataset=dataset_name,
+                backend=backend_name,
+                interface="cli",
+                project_id=ctx.project_id,
+                path_disclosure=ctx.path_disclosure,
+            )
+            result = client.table_info(table_name, show_sample=show_sample)
+            ctx_public = client.context.public_context()
+        except M4Error as exc:
+            if json_output:
+                _emit_agent_error(
+                    command,
+                    "describe_table_failed",
+                    str(exc),
+                    context=ctx.public_context(),
+                )
+            error(str(exc))
+            raise typer.Exit(code=1)
+
+    if json_output:
+        _emit_json(
+            _agent_success_payload(
+                command,
+                {
+                    "table_name": table_name,
+                    "schema": _dataframe_payload(result.get("schema")),
+                    "sample": _dataframe_payload(result.get("sample")),
+                },
+                context=ctx_public,
+            )
+        )
+        return
+
+    schema = result.get("schema")
+    if isinstance(schema, pd.DataFrame):
+        typer.echo(schema.to_string(index=False))
+    sample = result.get("sample")
+    if isinstance(sample, pd.DataFrame) and not sample.empty:
+        typer.echo("\nSample:")
+        typer.echo(sample.to_string(index=False))
+
+
+@app.command("query")
+def query_cmd(
+    sql: Annotated[
+        str,
+        typer.Option("--sql", help="SQL SELECT query to execute."),
+    ],
+    dataset_name: Annotated[
+        str | None,
+        typer.Option("--dataset", help="Dataset to query."),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option("--backend", help="Backend to use."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON for automation."),
+    ] = False,
+    no_interactive: Annotated[
+        bool,
+        typer.Option("--no-interactive", help="Accepted for automation."),
+    ] = False,
+):
+    """Execute a read-only SQL query without mutating active config."""
+    command = "query"
+    init_tools()
+    ctx = resolve_runtime_context(dataset=dataset_name, backend=backend_name)
+    with _silence_m4_logging() if json_output else nullcontext():
+        try:
+            client = M4Client(
+                dataset=dataset_name,
+                backend=backend_name,
+                interface="cli",
+                project_id=ctx.project_id,
+                path_disclosure=ctx.path_disclosure,
+            )
+            result = client.query(sql)
+            ctx_public = client.context.public_context()
+        except M4Error as exc:
+            if json_output:
+                _emit_agent_error(
+                    command,
+                    "query_failed",
+                    str(exc),
+                    context=ctx.public_context(),
+                )
+            error(str(exc))
+            raise typer.Exit(code=1)
+
+    if json_output:
+        _emit_json(
+            _agent_success_payload(
+                command,
+                {
+                    "result": _dataframe_payload(result),
+                },
+                context=ctx_public,
+            )
+        )
+        return
+
+    typer.echo(
+        result.to_string(index=False) if not result.empty else "No results found"
+    )
+
+
+@app.command("agent-env")
+def agent_env_cmd(
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="Agent mode: local or protected."),
+    ] = "local",
+    dataset_name: Annotated[
+        str | None,
+        typer.Option("--dataset", help="Default dataset for agent sessions."),
+    ] = None,
+    backend_name: Annotated[
+        str | None,
+        typer.Option("--backend", help="Default backend for agent sessions."),
+    ] = None,
+    project_id: Annotated[
+        str | None,
+        typer.Option("--project-id", help="BigQuery billing project ID."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print result as JSON."),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: dotenv, json, or text."),
+    ] = "dotenv",
+    include_paths: Annotated[
+        bool,
+        typer.Option("--paths", help="Disclose raw local paths in metadata."),
+    ] = False,
+):
+    """Return environment variables and command recommendations for agents."""
+    if json_output:
+        output_format = "json"
+    if output_format not in {"dotenv", "json", "text"}:
+        if output_format == "json":
+            _emit_agent_error(
+                "agent-env",
+                "invalid_format",
+                f"Unsupported format '{output_format}'.",
+                hint="Use --format dotenv, json, or text.",
+            )
+        error("Unsupported format. Use 'dotenv', 'json', or 'text'.")
+        raise typer.Exit(code=1)
+
+    result = build_agent_env_service(
+        mode=mode,
+        dataset=dataset_name,
+        backend=backend_name,
+        project_id=project_id,
+        include_paths=include_paths,
+    )
+    if isinstance(result, CommandError):
+        if output_format == "json":
+            _emit_agent_error(
+                "agent-env",
+                result.code,
+                result.message,
+                hint=result.hint,
+            )
+        error("Unsupported mode. Use 'local' or 'protected'.")
+        raise typer.Exit(code=1)
+
+    data = result.data
+
+    if output_format == "json":
+        _emit_json(
+            _agent_success_payload(
+                "agent-env",
+                data,
+                context=result.context,
+                warnings=result.warnings,
+            )
+        )
+        return
+
+    if output_format == "dotenv":
+        typer.echo("\n".join(_dotenv_lines(data["environment"])))
+        return
+
+    console.print("[bold]Agent environment[/bold]")
+    for line in _dotenv_lines(data["environment"]):
+        typer.echo(line)
+    console.print()
+    console.print("[bold]Recommended commands[/bold]")
+    for command in data["recommended_commands"]:
+        console.print(f"  [command]{command}[/command]")
+
+
+@provenance_app.command("export")
+def provenance_export_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print provenance as JSON."),
+    ] = False,
+):
+    """Export telemetry/provenance events from the configured event log."""
+    event_log = os.getenv("M4_EVENT_LOG")
+    path = (
+        Path(event_log).expanduser()
+        if event_log
+        else get_telemetry_dir() / "tool_calls.jsonl"
+    )
+    events: list[dict[str, Any]] = []
+    warnings_list: list[str] = []
+
+    if path.exists():
+        for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                warnings_list.append(f"Skipped malformed JSONL line {line_number}.")
+    else:
+        warnings_list.append(f"Provenance log does not exist: {path}")
+
+    ctx = resolve_runtime_context()
+    data = {
+        "event_log": str(path),
+        "event_count": len(events),
+        "events": _jsonable(events),
+    }
+
+    if json_output:
+        _emit_json(
+            _agent_success_payload(
+                "provenance export",
+                data,
+                context=ctx.public_context(),
+                warnings=warnings_list,
+            )
+        )
+        return
+
+    for event in events:
+        typer.echo(json.dumps(event, default=str))
 
 
 def _prompt_select_tools() -> list[str]:
@@ -1013,8 +2581,9 @@ def _prompt_select_skills() -> tuple[
     return None, None, None
 
 
-@app.command("skills")
+@skills_app.callback(invoke_without_command=True)
 def skills_cmd(
+    ctx: typer.Context,
     tools: Annotated[
         str | None,
         typer.Option(
@@ -1074,6 +2643,10 @@ def skills_cmd(
     • m4 skills --tools claude --skills sofa-score,m4-api  # Specific skills
 
     • m4 skills --list                       # Show installed skills
+
+    • m4 skills catalog --json               # Emit versioned catalog
+
+    • m4 skills materialize --target PATH --json  # Copy managed bundle
     """
     from m4.skills import (
         AI_TOOLS,
@@ -1082,6 +2655,9 @@ def skills_cmd(
         install_skills,
     )
     from m4.skills.installer import _parse_skill_metadata
+
+    if ctx.invoked_subcommand is not None:
+        return
 
     if list_installed:
         # Show installed skills with metadata
@@ -1195,6 +2771,92 @@ def skills_cmd(
         raise typer.Exit(code=1)
 
 
+@skills_app.command("catalog")
+def skills_catalog_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the versioned machine-readable manifest."),
+    ] = False,
+):
+    """Inspect the complete packaged M4 skill catalog without installing it."""
+    from m4.skills import build_catalog
+
+    try:
+        with _silence_m4_logging():
+            manifest = build_catalog()
+    except Exception as exc:
+        if json_output:
+            _emit_json(
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "error": {"code": "skills_catalog_failed", "message": str(exc)},
+                }
+            )
+        else:
+            error(f"Skills catalog failed: {exc}")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        _emit_json(manifest)
+        return
+
+    typer.echo(
+        f"M4 {manifest['packageVersion']} skills: {len(manifest['skills'])} "
+        f"({manifest['bundleDigest']})"
+    )
+    for skill in manifest["skills"]:
+        typer.echo(f"- {skill['id']} [{skill['tier']}/{skill['category']}]")
+
+
+@skills_app.command("materialize")
+def skills_materialize_cmd(
+    target: Annotated[
+        Path,
+        typer.Option(
+            "--target",
+            help="Explicit destination for the immutable managed skill bundle.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable result."),
+    ] = False,
+):
+    """Atomically materialize the complete packaged bundle into TARGET."""
+    from m4.skills import materialize_catalog
+
+    try:
+        with _silence_m4_logging():
+            result = materialize_catalog(target)
+    except Exception as exc:
+        if json_output:
+            _emit_json(
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "error": {
+                        "code": "skills_materialize_failed",
+                        "message": str(exc),
+                    },
+                }
+            )
+        else:
+            error(f"Skills materialization failed: {exc}")
+        raise typer.Exit(code=1)
+
+    payload = {"ok": True, **result}
+    if json_output:
+        _emit_json(payload)
+        return
+
+    state = "Reused" if result["reused"] else "Materialized"
+    success(
+        f"{state} {result['skillCount']} M4 skills at {result['target']} "
+        f"({result['bundleDigest']})"
+    )
+
+
 @app.command("config")
 def config_cmd(
     client: Annotated[
@@ -1285,174 +2947,68 @@ def config_cmd(
 
     • m4 config claude --backend bigquery --project-id my-project
     """
-    try:
-        from m4 import mcp_client_configs
-
-        script_dir = Path(mcp_client_configs.__file__).parent
-    except ImportError:
-        error("Could not find m4.mcp_client_configs package")
-        raise typer.Exit(code=1)
-
-    # Track whether backend/project_id were explicitly provided by the user
-    backend_explicit = backend is not None
-    project_id_explicit = project_id is not None
-    if backend is None:
-        backend = get_active_backend()
-
-    # Infer project_id from config when backend is bigquery and not explicitly passed
-    if backend == "bigquery" and not project_id:
-        project_id = get_bigquery_project_id()
-
-    # Validate backend-specific arguments only when --backend is explicit
-    if backend_explicit:
-        # duckdb: db_path allowed, project_id not allowed
-        if backend == "duckdb" and project_id:
-            error("--project-id can only be used with --backend bigquery")
-            raise typer.Exit(code=1)
-
-        # bigquery: requires project_id, db_path not allowed
-        if backend == "bigquery" and db_path:
-            error("--db-path can only be used with --backend duckdb")
-            raise typer.Exit(code=1)
-        if backend == "bigquery" and not project_id:
-            error("--project-id is required when using --backend bigquery")
-            raise typer.Exit(code=1)
-
-    # Even when inferred, bigquery still requires a project_id
-    if backend == "bigquery" and not project_id:
-        error(
-            "BigQuery backend requires a project ID. "
-            "Set it with: m4 backend bigquery --project-id <ID>"
+    if client != "claude":
+        info(
+            "Generating M4 MCP configuration..."
+            if quick
+            else "Starting interactive M4 MCP configuration..."
         )
+
+    result = configure_mcp_service(
+        MCPConfigRequest(
+            client=client,
+            backend=backend,
+            db_path=db_path,
+            project_id=project_id,
+            python_path=python_path,
+            working_directory=working_directory,
+            server_name=server_name,
+            output=output,
+            quick=quick,
+        )
+    )
+    if isinstance(result, CommandError):
+        error(result.message)
         raise typer.Exit(code=1)
 
     if client == "claude":
-        # Run the Claude Desktop setup script
-        script_path = script_dir / "setup_claude_desktop.py"
-
-        if not script_path.exists():
-            error(f"Claude Desktop setup script not found at {script_path}")
-            raise typer.Exit(code=1)
-
-        # Build command arguments with smart defaults inferred from runtime config
-        cmd = [sys.executable, str(script_path)]
-
-        # Always pass backend if not duckdb; duckdb is the script default
-        if backend != "duckdb":
-            cmd.extend(["--backend", backend])
-
-        # For duckdb, pass db_path only if explicitly provided.
-        # If omitted, the server will resolve it dynamically based on the active dataset.
-        if backend == "duckdb" and db_path:
-            inferred_db_path = Path(db_path).resolve()
-            cmd.extend(["--db-path", str(inferred_db_path)])
-
-        elif backend == "bigquery" and project_id:
-            cmd.extend(["--project-id", project_id])
-
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=False)
-            if result.returncode == 0:
-                # Persist backend and project_id only if explicitly provided
-                if backend_explicit:
-                    set_active_backend(backend)
-                if project_id_explicit:
-                    set_bigquery_project_id(project_id)
-                success("Claude Desktop configuration completed!")
-        except subprocess.CalledProcessError as e:
-            error(f"Claude Desktop setup failed with exit code {e.returncode}")
-            raise typer.Exit(code=e.returncode)
-        except FileNotFoundError:
-            error("Python interpreter not found. Please ensure Python is installed.")
-            raise typer.Exit(code=1)
-
-        # Install skills if requested (Claude-only for backwards compatibility)
+        success("Claude Desktop configuration completed!")
         if skills:
-            from m4.skills import AI_TOOLS, install_skills
+            skill_result = install_config_skills_service(["claude"])
+            if isinstance(skill_result, CommandError):
+                warning(f"Skills installation failed: {skill_result.message}")
+            else:
+                for item in skill_result.data["installed"]:
+                    success(f"Installed skill: {item['skill']} -> {item['path']}")
+        return
 
-            try:
-                results = install_skills(tools=["claude"])
-                for tool_name, paths in results.items():
-                    tool = AI_TOOLS[tool_name]
-                    for skill_path in paths:
-                        success(f"Installed skill: {skill_path.name} → {skill_path}")
-            except Exception as e:
-                warning(f"Skills installation failed: {e}")
+    data = result.data
+    for line in summarize_generated_config(data["config"], data["backend"]):
+        typer.echo(line)
 
+    if data["output"]:
+        typer.echo(f"\nConfiguration saved to: {data['output']}")
     else:
-        # Run the dynamic config generator
-        script_path = script_dir / "dynamic_mcp_config.py"
+        typer.echo("\nMCP Configuration (copy and paste this into your MCP client):")
+        typer.echo("=" * 70)
+        typer.echo(data["config_json"])
+        typer.echo("=" * 70)
 
-        if not script_path.exists():
-            error(f"Dynamic config script not found at {script_path}")
-            raise typer.Exit(code=1)
+    if quick:
+        success("Configuration generated successfully!")
 
-        # Build command arguments
-        cmd = [sys.executable, str(script_path)]
-
-        if quick:
-            cmd.append("--quick")
-
-        if backend != "duckdb":
-            cmd.extend(["--backend", backend])
-
-        if server_name != "m4":
-            cmd.extend(["--server-name", server_name])
-
-        if python_path:
-            cmd.extend(["--python-path", python_path])
-
-        if working_directory:
-            cmd.extend(["--working-directory", working_directory])
-
-        if backend == "duckdb" and db_path:
-            cmd.extend(["--db-path", db_path])
-        elif backend == "bigquery" and project_id:
-            cmd.extend(["--project-id", project_id])
-
-        if output:
-            cmd.extend(["--output", output])
-
-        if quick:
-            info("Generating M4 MCP configuration...")
+    if skills:
+        selected_tools = _prompt_select_tools()
+        console.print()
+        info(f"Installing skills for: {', '.join(selected_tools)}")
+        skill_result = install_config_skills_service(selected_tools)
+        if isinstance(skill_result, CommandError):
+            warning(f"Skills installation failed: {skill_result.message}")
         else:
-            info("Starting interactive M4 MCP configuration...")
-
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=False)
-            if result.returncode == 0:
-                # Persist backend and project_id only if explicitly provided
-                if backend_explicit:
-                    set_active_backend(backend)
-                if project_id_explicit:
-                    set_bigquery_project_id(project_id)
-                if quick:
-                    success("Configuration generated successfully!")
-        except subprocess.CalledProcessError as e:
-            error(f"Configuration generation failed with exit code {e.returncode}")
-            raise typer.Exit(code=e.returncode)
-        except FileNotFoundError:
-            error("Python interpreter not found. Please ensure Python is installed.")
-            raise typer.Exit(code=1)
-
-        # Install skills if requested (interactive tool selection)
-        if skills:
-            from m4.skills import AI_TOOLS, install_skills
-
-            selected_tools = _prompt_select_tools()
-            console.print()
-            info(f"Installing skills for: {', '.join(selected_tools)}")
-
-            try:
-                results = install_skills(tools=selected_tools)
-                for tool_name, paths in results.items():
-                    tool = AI_TOOLS[tool_name]
-                    for skill_path in paths:
-                        success(
-                            f"Installed skill: {skill_path.name} → {tool.display_name}"
-                        )
-            except Exception as e:
-                warning(f"Skills installation failed: {e}")
+            for item in skill_result.data["installed"]:
+                success(
+                    f"Installed skill: {item['skill']} -> {item['tool_display_name']}"
+                )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from m4.core.datasets import (
     DatasetDefinition,
     DatasetRegistry,
@@ -124,12 +126,41 @@ class TestDatasetRegistry:
         DatasetRegistry.reset()
         all_datasets = DatasetRegistry.list_all()
 
-        assert len(all_datasets) >= 4
-        names = [ds.name for ds in all_datasets]
-        assert "mimic-iv-demo" in names
-        assert "mimic-iv" in names
-        assert "mimic-iv-note" in names
-        assert "eicu" in names
+        names = {ds.name for ds in all_datasets}
+        assert names >= {
+            "mimic-iv-demo",
+            "mimic-iv",
+            "mimic-iv-note",
+            "mimic-iv-ed-demo",
+            "mimic-iv-ed",
+            "eicu-demo",
+            "eicu",
+            "mimic-iii",
+            "mimic-cxr-jpg",
+        }
+        assert all(DatasetRegistry.is_builtin(name) for name in names)
+
+    def test_mimic_cxr_jpg_downloads_tables_and_says_where_its_images_are(self):
+        DatasetRegistry.reset()
+        ds = DatasetRegistry.get("mimic-cxr-jpg")
+
+        assert ds.modalities == frozenset({Modality.TABULAR, Modality.IMAGING})
+        assert ds.requires_authentication
+        assert ds.dua_url == "https://physionet.org/content/mimic-cxr-jpg/"
+        # The tables only: the images are half a terabyte
+        assert ds.download_size_gb < 0.1
+        assert ds.subdirectories_to_scan == []
+        assert set(ds.table_names.values()) == {
+            "metadata",
+            "chexpert",
+            "negbio",
+            "split",
+            "test_labels",
+        }
+        assert ds.primary_verification_table == "mimic_cxr.metadata"
+        assert ds.images.table == "mimic_cxr.metadata"
+        assert ds.images.view == "mimic_cxr.images"
+        assert ds.images.id_column == "dicom_id"
 
     def test_mimic_demo_schema_mapping(self):
         """Test MIMIC-IV demo has correct schema mappings."""
@@ -171,6 +202,59 @@ class TestDatasetRegistry:
         assert ds.schema_mapping == {"": "eicu_crd"}
         assert ds.bigquery_schema_mapping == {"eicu_crd": "eicu_crd"}
         assert ds.primary_verification_table == "eicu_crd.patient"
+
+    @pytest.mark.parametrize(
+        ("demo", "full"), [("eicu-demo", "eicu"), ("mimic-iv-ed-demo", "mimic-iv-ed")]
+    )
+    def test_demo_uses_the_schemas_of_its_full_dataset(self, demo, full):
+        """SQL written for the full dataset runs unchanged on its open demo."""
+        DatasetRegistry.reset()
+        demo_ds = DatasetRegistry.get(demo)
+        full_ds = DatasetRegistry.get(full)
+        assert demo_ds.schema_mapping == full_ds.schema_mapping
+        assert demo_ds.primary_verification_table == full_ds.primary_verification_table
+        assert set(demo_ds.bigquery_schema_mapping) == set(
+            full_ds.bigquery_schema_mapping
+        )
+        assert demo_ds.requires_authentication is False
+        assert full_ds.requires_authentication is True
+
+    def test_new_builtin_schema_mappings(self):
+        DatasetRegistry.reset()
+        ed = DatasetRegistry.get("mimic-iv-ed")
+        assert ed.schema_mapping == {"ed": "mimiciv_ed"}
+        assert ed.subdirectories_to_scan == ["ed"]
+        assert ed.primary_verification_table == "mimiciv_ed.edstays"
+        assert ed.bigquery_schema_mapping == {"mimiciv_ed": "mimiciv_ed"}
+        assert "mimic-iv" in ed.related_datasets
+
+        eicu_demo = DatasetRegistry.get("eicu-demo")
+        assert eicu_demo.bigquery_schema_mapping == {"eicu_crd": "eicu_crd_demo"}
+
+        ed_demo = DatasetRegistry.get("mimic-iv-ed-demo")
+        assert ed_demo.bigquery_project_id == "physionet-demo"
+
+        mimic_iii = DatasetRegistry.get("mimic-iii")
+        assert mimic_iii.schema_mapping == {"": "mimiciii_clinical"}
+        assert mimic_iii.subdirectories_to_scan == []
+        assert mimic_iii.primary_verification_table == "mimiciii_clinical.admissions"
+        assert mimic_iii.bigquery_schema_mapping == {
+            "mimiciii_clinical": "mimiciii_clinical"
+        }
+        assert mimic_iii.requires_authentication is True
+
+    def test_builtins_describe_the_version_they_download(self):
+        """Each built-in names the PhysioNet version its download address holds."""
+        DatasetRegistry.reset()
+        for ds in DatasetRegistry.list_all():
+            assert ds.version, ds.name
+            assert ds.file_listing_url.endswith(f"/{ds.version}/"), ds.name
+            assert ds.title and ds.title != ds.name, ds.name
+            assert ds.summary, ds.name
+            assert ds.dataset_page_url.startswith("https://physionet.org/content/")
+            # Open datasets show their file sizes publicly; credentialed ones not
+            if not ds.requires_authentication:
+                assert ds.download_size_gb and ds.download_size_gb > 0, ds.name
 
 
 class TestDatasetRegistryEdgeCases:
@@ -216,20 +300,17 @@ class TestDatasetRegistryEdgeCases:
         DatasetRegistry.reset()
         assert DatasetRegistry.get("nonexistent-dataset-xyz") is None
 
-    def test_get_active_no_config_raises(self, monkeypatch):
-        """get_active() raises DatasetError when no dataset is configured."""
+    def test_get_active_raises_removed_state_error(self):
+        """get_active() raises DatasetError because global state was removed."""
         import pytest
 
-        import m4.config as cfg
         from m4.core.exceptions import DatasetError
 
-        monkeypatch.setattr(cfg, "get_active_dataset", lambda: None)
-
-        with pytest.raises(DatasetError, match="No active dataset"):
+        with pytest.raises(DatasetError, match=r"DatasetRegistry\.get_active"):
             DatasetRegistry.get_active()
 
-    def test_get_active_unknown_dataset_raises(self, monkeypatch):
-        """get_active() raises DatasetError when config points to unknown dataset."""
+    def test_get_active_ignores_legacy_config(self, monkeypatch):
+        """get_active() does not route through legacy active dataset config."""
         import pytest
 
         import m4.config as cfg
@@ -237,7 +318,7 @@ class TestDatasetRegistryEdgeCases:
 
         monkeypatch.setattr(cfg, "get_active_dataset", lambda: "no-such-dataset")
 
-        with pytest.raises(DatasetError, match="not found in registry"):
+        with pytest.raises(DatasetError, match=r"DatasetRegistry\.get_active"):
             DatasetRegistry.get_active()
 
     def test_custom_json_oversized_file_skipped(self, tmp_path):
@@ -271,6 +352,119 @@ class TestDatasetRegistryEdgeCases:
 
         DatasetRegistry.reset()
 
+    def test_custom_json_with_catalog_fields(self, tmp_path):
+        """A custom file can describe itself the way built-ins do."""
+        (tmp_path / "described.json").write_text(
+            json.dumps(
+                {
+                    "name": "my-icu-extract",
+                    "title": "My ICU extract",
+                    "summary": "Adult ICU stays at one hospital.",
+                    "version": "2024-06",
+                    "download_size_gb": 1.5,
+                }
+            )
+        )
+        (tmp_path / "bare.json").write_text(json.dumps({"name": "bare-extract"}))
+
+        DatasetRegistry.reset()
+        DatasetRegistry.load_custom_datasets(tmp_path)
+
+        described = DatasetRegistry.get("my-icu-extract")
+        assert described.title == "My ICU extract"
+        assert described.summary == "Adult ICU stays at one hospital."
+        assert described.version == "2024-06"
+        assert described.download_size_gb == 1.5
+        assert not DatasetRegistry.is_builtin("my-icu-extract")
+
+        bare = DatasetRegistry.get("bare-extract")
+        assert bare.title == "bare-extract"
+        assert bare.summary is None
+        assert bare.version is None
+        assert bare.download_size_gb is None
+
+        DatasetRegistry.reset()
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["..", "../parquet/eicu", "/tmp/elsewhere.duckdb", "sub/x.duckdb", "x.db"],
+    )
+    def test_custom_json_database_must_be_a_plain_file_name(
+        self, tmp_path, caplog, filename
+    ):
+        """M4 removes the database by this name: it must not lead elsewhere."""
+        (tmp_path / "odd.json").write_text(
+            json.dumps({"name": "odd", "default_duckdb_filename": filename})
+        )
+
+        DatasetRegistry.reset()
+        with caplog.at_level("WARNING", logger="m4.core.datasets"):
+            DatasetRegistry.load_custom_datasets(tmp_path)
+
+        assert DatasetRegistry.get("odd") is None
+        assert "odd.json" in caplog.text
+        DatasetRegistry.reset()
+
+    def test_custom_json_with_images_and_table_names(self, tmp_path):
+        (tmp_path / "scans.json").write_text(
+            json.dumps(
+                {
+                    "name": "my-scans",
+                    "modalities": ["TABULAR", "IMAGING"],
+                    "schema_mapping": {"": "scans"},
+                    "table_names": {"scan-list-v2": "scans"},
+                    "images": {
+                        "table": "scans.scans",
+                        "view": "scans.images",
+                        "id_column": "scan_id",
+                        "path_template": "images/{patient_id}/{scan_id}.png",
+                    },
+                }
+            )
+        )
+
+        DatasetRegistry.reset()
+        DatasetRegistry.load_custom_datasets(tmp_path)
+
+        ds = DatasetRegistry.get("my-scans")
+        assert Modality.IMAGING in ds.modalities
+        assert ds.table_names == {"scan-list-v2": "scans"}
+        assert ds.images.is_image_path("images/7/42.png")
+        DatasetRegistry.reset()
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            # Images without the modality, and the modality without images
+            {
+                "images": {
+                    "table": "s.t",
+                    "view": "s.v",
+                    "id_column": "id",
+                    "path_template": "{id}.png",
+                }
+            },
+            {"modalities": ["TABULAR", "IMAGING"]},
+            {"table_names": {"labs": "lab results"}},
+            {
+                "modalities": ["IMAGING"],
+                "images": {"table": "s.t", "view": "s.v", "id_column": "id"},
+            },
+        ],
+    )
+    def test_custom_json_with_images_m4_cannot_use_is_skipped(
+        self, tmp_path, caplog, fields
+    ):
+        (tmp_path / "odd.json").write_text(json.dumps({"name": "odd", **fields}))
+
+        DatasetRegistry.reset()
+        with caplog.at_level("WARNING", logger="m4.core.datasets"):
+            DatasetRegistry.load_custom_datasets(tmp_path)
+
+        assert DatasetRegistry.get("odd") is None
+        assert "odd.json" in caplog.text
+        DatasetRegistry.reset()
+
     def test_load_custom_datasets_nonexistent_dir(self, tmp_path):
         """load_custom_datasets with nonexistent directory does not crash."""
         DatasetRegistry.reset()
@@ -286,6 +480,50 @@ class TestDatasetRegistryEdgeCases:
         DatasetRegistry.load_custom_datasets(tmp_path)
         # Should not crash; malformed file is simply skipped
         assert DatasetRegistry.get("mimic-iv-demo") is not None
+
+    @pytest.mark.parametrize(
+        "name", ["mimic-iv", "MIMIC-IV", "eicu", "mimic-iv-ed", "mimic-iii"]
+    )
+    def test_custom_json_cannot_redefine_a_builtin_dataset(
+        self, tmp_path, caplog, name
+    ):
+        """A file in the datasets folder must not change where a built-in
+        dataset is downloaded from, or anything else about it."""
+        DatasetRegistry.reset()
+        builtin = DatasetRegistry.get(name)
+        assert builtin.file_listing_url.startswith("https://physionet.org/files/")
+        (tmp_path / "anything.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "file_listing_url": "https://example.test/collect/",
+                    "requires_authentication": True,
+                }
+            )
+        )
+
+        with caplog.at_level("WARNING", logger="m4.core.datasets"):
+            DatasetRegistry.load_custom_datasets(tmp_path)
+
+        assert DatasetRegistry.get(name) is builtin
+        assert "anything.json" in caplog.text
+        assert "built-in" in caplog.text
+
+        DatasetRegistry.reset()
+
+    def test_custom_json_with_a_new_name_still_loads_next_to_an_ignored_one(
+        self, tmp_path
+    ):
+        (tmp_path / "a-shadow.json").write_text(json.dumps({"name": "mimic-iv"}))
+        (tmp_path / "b-new.json").write_text(json.dumps({"name": "my-cohort"}))
+
+        DatasetRegistry.reset()
+        DatasetRegistry.load_custom_datasets(tmp_path)
+
+        assert DatasetRegistry.get("my-cohort") is not None
+        assert DatasetRegistry.get("mimic-iv").requires_authentication is True
+
+        DatasetRegistry.reset()
 
 
 class TestJSONLoading:

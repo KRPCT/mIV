@@ -289,15 +289,19 @@ def print_dataset_status(
     parquet_size_gb: float | None = None,
     bigquery_available: bool = False,
     row_count: int | None = None,
-    is_active: bool = False,
+    is_selected: bool = False,
     derived_materialized: int | None = None,
     derived_total: int | None = None,
     derived_has_support: bool = False,
     derived_is_bigquery: bool = False,
+    prepared: bool = True,
 ) -> None:
-    """Print formatted dataset status information."""
-    # Header with active indicator
-    status_indicator = "[success] (active)[/success]" if is_active else ""
+    """Print formatted dataset status information.
+
+    Pass prepared=False when local files exist but `m4 init` has not finished.
+    """
+    # Header with selected indicator
+    status_indicator = "[success] (selected)[/success]" if is_selected else ""
     console.print(f"\n[brand]{name.upper()}[/brand]{status_indicator}")
 
     # Status icons
@@ -307,6 +311,11 @@ def print_dataset_status(
 
     console.print(f"  [muted]Local Parquet:[/muted] {pq_status}")
     console.print(f"  [muted]Local DuckDB:[/muted]  {db_status}")
+    if (parquet_present or db_present) and not prepared:
+        console.print(
+            "  [muted]Local setup:[/muted]   [warning]INCOMPLETE[/warning] "
+            f"(run m4 init {name})"
+        )
     console.print(f"  [muted]BigQuery:[/muted]      {bq_status}")
 
     # Derived status line
@@ -359,15 +368,16 @@ def print_error_panel(title: str, message: str, hint: str | None = None) -> None
 
 def print_datasets_table(
     datasets: list[dict],
-    active_dataset: str | None = None,
+    selected_dataset: str | None = None,
 ) -> None:
     """
     Print a compact table of all datasets.
 
     Args:
         datasets: List of dicts with keys: name, parquet_present, db_present,
-                  bigquery_available, parquet_size_gb (optional)
-        active_dataset: Name of the currently active dataset
+                  prepared (optional), bigquery_available,
+                  parquet_size_gb (optional)
+        selected_dataset: Name of the dataset selected for this status view
     """
     table = Table(
         show_header=True,
@@ -377,7 +387,7 @@ def print_datasets_table(
     )
 
     table.add_column("Dataset", style="bold")
-    table.add_column("Active", justify="center")
+    table.add_column("Selected", justify="center")
     table.add_column("Local", justify="center")
     table.add_column("BigQuery", justify="center")
     table.add_column("Derived", justify="center")
@@ -385,16 +395,19 @@ def print_datasets_table(
 
     for ds in datasets:
         name = ds["name"]
-        is_active = name == active_dataset
+        is_selected = name == selected_dataset
 
-        # Active indicator
-        active_str = "[success]*[/success]" if is_active else "[muted]-[/muted]"
+        # Selected indicator
+        selected_str = "[success]*[/success]" if is_selected else "[muted]-[/muted]"
 
         # Local status (combine parquet + duckdb)
         pq = ds.get("parquet_present", False)
         db = ds.get("db_present", False)
-        if pq and db:
+        if pq and db and ds.get("prepared", True):
             local_str = "[success]OK[/success]"
+        elif pq and db:
+            # The files are there, but m4 init has not finished
+            local_str = "[warning]Incomplete[/warning]"
         elif pq:
             local_str = "[warning]Parquet[/warning]"
         elif db:
@@ -421,6 +434,6 @@ def print_datasets_table(
         else:
             size_str = "[muted]-[/muted]"
 
-        table.add_row(name, active_str, local_str, bq_str, derived_str, size_str)
+        table.add_row(name, selected_str, local_str, bq_str, derived_str, size_str)
 
     console.print(table)

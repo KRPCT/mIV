@@ -4,16 +4,18 @@ M4 provides rigorous, auditable infrastructure for AI-assisted clinical research
 offering a safe interface for LLMs and autonomous agents to interact with EHR data.
 
 Quick Start:
-    from m4 import execute_query, set_dataset, get_schema
+    from m4 import execute_query, get_schema
 
-    set_dataset("mimic-iv")
-    print(get_schema())
-    result = execute_query("SELECT COUNT(*) FROM mimiciv_hosp.patients")
+    print(get_schema(dataset="mimic-iv"))
+    result = execute_query(
+        "SELECT COUNT(*) FROM mimiciv_hosp.patients",
+        dataset="mimic-iv",
+    )
 
 For MCP server usage, run: m4 serve
 """
 
-__version__ = "0.4.3"
+__version__ = "0.5.9"
 
 # Expose API functions at package level for easy imports
 from vitrine import show
@@ -21,13 +23,18 @@ from vitrine import show
 from m4.api import (
     # Exceptions
     DatasetError,
+    ImageFetchError,
+    M4Client,
     M4Error,
     ModalityError,
     QueryError,
     # Tabular data
     execute_query,
+    # Images
+    fetch_images,
     # Dataset management
     get_active_dataset,
+    get_capabilities,
     # Clinical notes
     get_note,
     get_schema,
@@ -36,6 +43,7 @@ from m4.api import (
     get_telemetry_path,
     list_datasets,
     list_patient_notes,
+    local_image_paths,
     search_notes,
     set_dataset,
 )
@@ -43,18 +51,23 @@ from m4.core.telemetry import set_agent_id
 
 __all__ = [
     "DatasetError",
+    "ImageFetchError",
+    "M4Client",
     "M4Error",
     "ModalityError",
     "QueryError",
     "__version__",
     "execute_query",
+    "fetch_images",
     "get_active_dataset",
+    "get_capabilities",
     "get_note",
     "get_schema",
     "get_table_info",
     "get_telemetry_path",
     "list_datasets",
     "list_patient_notes",
+    "local_image_paths",
     "search_notes",
     "set_agent_id",
     "set_dataset",

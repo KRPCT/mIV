@@ -3,6 +3,7 @@ name: first-icu-stay
 description: Identify first ICU stays and first hospital admissions for cohort selection. Use to exclude readmissions, create independent observations, or build adult patient cohorts.
 tier: validated
 category: clinical
+kind: methodology
 ---
 
 # First ICU Stay Selection
@@ -176,7 +177,7 @@ ORDER BY 1;
 ## Related Exclusion Criteria
 
 Common additional exclusions for research cohorts:
-- Comfort care / DNR orders (see `mimiciv_derived.code_status`)
+- Comfort care / DNR orders if your local dataset includes a validated code-status concept
 - Organ donors
 - Very short stays (< 4-24 hours)
 - Missing key data elements

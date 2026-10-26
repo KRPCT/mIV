@@ -1,0 +1,1609 @@
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_module(name: str, relative_path: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_detect_agent_failure_reason_identifies_claude_auth(tmp_path):
+    run = _load_module("benchmark_run_failure_auth", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"result","subtype":"success","is_error":true,'
+        '"result":"Invalid API key · Fix external API key"}\n'
+    )
+
+    reason = run._detect_agent_failure_reason(
+        "claude",
+        {
+            "stdout": "Invalid API key · Fix external API key",
+            "stderr": "",
+            "trace_file": str(trace),
+        },
+    )
+
+    assert reason == "auth"
+
+
+def test_extract_claude_rate_limit_reset_at(tmp_path):
+    run = _load_module("benchmark_run_rate_reset", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"blocked",'
+        '"resetsAt":1775545200,"rateLimitType":"five_hour"}}\n'
+    )
+
+    assert run._extract_claude_rate_limit_reset_at(trace) == 1775545200
+
+
+def test_detect_agent_failure_reason_ignores_429_inside_paths(tmp_path):
+    run = _load_module("benchmark_run_rate_path", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",'
+        '"resetsAt":1777280400,"rateLimitType":"five_hour"}}\n'
+    )
+
+    reason = run._detect_agent_failure_reason(
+        "claude",
+        {
+            "stdout": "output at /tmp/run_042930/output.csv",
+            "stderr": "",
+            "trace_file": str(trace),
+        },
+    )
+
+    assert reason is None
+
+
+def test_detect_agent_failure_reason_allows_claude_usage_warning(tmp_path):
+    run = _load_module("benchmark_run_rate_allowed_warning", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning",'
+        '"resetsAt":1778058000,"rateLimitType":"seven_day","utilization":0.26}}\n'
+    )
+
+    reason = run._detect_agent_failure_reason(
+        "claude",
+        {
+            "stdout": "",
+            "stderr": "",
+            "trace_file": str(trace),
+        },
+    )
+
+    assert reason is None
+
+
+def test_detect_agent_failure_reason_ignores_rate_text_after_success(tmp_path):
+    run = _load_module("benchmark_run_rate_success_text", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"result","subtype":"success","is_error":false,'
+        '"result":"Output written"}\n'
+    )
+
+    reason = run._detect_agent_failure_reason(
+        "claude",
+        {
+            "returncode": 0,
+            "stdout": '{"type":"rate_limit_event","rate_limit_info":'
+            '{"status":"allowed_warning","rateLimitType":"seven_day"}}',
+            "stderr": "",
+            "trace_file": str(trace),
+        },
+    )
+
+    assert reason is None
+
+
+# ── Isolated workdir ────────────────────────────────────────────────────
+
+
+def test_setup_isolated_workdir_uses_requested_schema(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_isolated", "benchmark/run.py")
+
+    cached_db = tmp_path / "cached.duckdb"
+    cached_db.write_text("db")
+    seen: dict[str, str] = {}
+
+    monkeypatch.setattr(run, "ISOLATED_BASE", tmp_path / "isolated")
+
+    def fake_get_cached_db(task_name: str, schema: str = "native") -> Path:
+        seen["task_name"] = task_name
+        seen["schema"] = schema
+        return cached_db
+
+    monkeypatch.setattr(run, "_get_cached_db", fake_get_cached_db)
+    monkeypatch.setattr(run, "_create_isolated_settings", lambda workdir: workdir)
+
+    workdir = run.setup_isolated_workdir(
+        "mimic-sirs-24h-raw", "run123", schema="obfuscated"
+    )
+
+    assert seen == {"task_name": "mimic-sirs-24h-raw", "schema": "obfuscated"}
+    assert (workdir / "database.duckdb").read_text() == "db"
+
+
+def test_db_cache_is_private(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_db_cache_private", "benchmark/run.py")
+
+    agent_db = tmp_path / "agent_db"
+    agent_db.mkdir()
+    source = agent_db / "mimic_iv_sirs.duckdb"
+    source.write_text("db")
+
+    monkeypatch.setattr(run, "AGENT_DB_DIR", agent_db)
+    monkeypatch.setattr(run, "DB_CACHE", tmp_path / "cache")
+
+    cached = run._get_cached_db("mimic-sirs")
+
+    assert cached.read_text() == "db"
+    assert (run.DB_CACHE.stat().st_mode & 0o777) == 0o700
+    assert (cached.stat().st_mode & 0o777) == 0o600
+
+
+def test_failed_runs_are_excluded_from_results_discovery():
+    run = _load_module("benchmark_run_export_gate", "benchmark/run.py")
+
+    assert run._should_export_run_record(
+        publishable=True,
+        contamination_clean=True,
+    )
+    assert not run._should_export_run_record(
+        publishable=True,
+        contamination_clean=False,
+    )
+    assert not run._should_export_run_record(
+        publishable=False,
+        contamination_clean=True,
+    )
+
+
+# ── Per-run HOME seeding ────────────────────────────────────────────────
+
+
+def test_prepare_run_home_copies_minimal_auth_files(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_home", "benchmark/run.py")
+
+    auth_root = tmp_path / "auth"
+    (auth_root / ".codex").mkdir(parents=True)
+    (auth_root / ".gemini").mkdir(parents=True)
+    (auth_root / ".codex" / "auth.json").write_text("{}")
+    (auth_root / ".codex" / "config.toml").write_text('model = "gpt-5"')
+    (auth_root / ".gemini" / "oauth_creds.json").write_text("{}")
+    (auth_root / ".gemini" / "google_accounts.json").write_text("[]")
+    (auth_root / ".gemini" / "state.json").write_text("{}")
+    (auth_root / ".gemini" / "settings.json").write_text("{}")
+    (auth_root / ".gemini" / "installation_id").write_text("abc")
+    (auth_root / ".gemini" / "trustedFolders.json").write_text("[]")
+
+    monkeypatch.setenv("M4BENCH_AUTH_ROOT", str(auth_root))
+
+    codex_home = tmp_path / "codex-home"
+    copied_codex = run.prepare_run_home("codex", codex_home)
+    assert copied_codex == [".codex/auth.json"]
+    assert (codex_home / ".codex" / "auth.json").exists()
+    assert not (codex_home / ".codex" / "config.toml").exists()
+
+    gemini_home = tmp_path / "gemini-home"
+    copied_gemini = run.prepare_run_home("gemini", gemini_home)
+    assert copied_gemini == [
+        ".gemini/oauth_creds.json",
+        ".gemini/google_accounts.json",
+        ".gemini/state.json",
+        ".gemini/settings.json",
+        ".gemini/installation_id",
+    ]
+    assert (gemini_home / ".gemini" / "oauth_creds.json").exists()
+    assert (gemini_home / ".gemini" / "projects.json").exists()
+    gemini_settings = json.loads(
+        (gemini_home / ".gemini" / "settings.json").read_text()
+    )
+    assert gemini_settings["security"]["auth"]["selectedType"] == "oauth-personal"
+    assert gemini_settings["security"]["blockGitExtensions"] is True
+    assert gemini_settings["admin"]["extensions"]["enabled"] is False
+    assert gemini_settings["admin"]["skills"]["enabled"] is True
+    assert not (gemini_home / ".gemini" / "trustedFolders.json").exists()
+
+
+def test_prepare_run_home_claude_login_copies_only_auth_files(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_claude_container_home", "benchmark/run.py")
+
+    auth_root = tmp_path / "claude-auth"
+    (auth_root / ".claude" / "projects" / "memory").mkdir(parents=True)
+    (auth_root / ".claude.json").write_text("{}")
+    (auth_root / ".claude" / ".credentials.json").write_text("{}")
+    (auth_root / ".claude" / "projects" / "memory" / "state.json").write_text("{}")
+
+    monkeypatch.setenv("M4BENCH_CLAUDE_AUTH_ROOT", str(auth_root))
+
+    claude_home = tmp_path / "claude-home"
+    copied = run.prepare_run_home("claude", claude_home)
+
+    assert copied == [".claude.json", ".claude/.credentials.json"]
+    assert (claude_home / ".claude.json").exists()
+    assert (claude_home / ".claude" / ".credentials.json").exists()
+    assert not (claude_home / ".claude" / "projects").exists()
+
+
+@pytest.mark.parametrize("routing", ["native", "single-model"])
+@pytest.mark.parametrize("managed_home", [False, True])
+def test_direct_claude_run_configures_command_and_env(
+    monkeypatch, tmp_path, routing, managed_home
+):
+    monkeypatch.setenv("M4BENCH_CLAUDE_MODEL_ROUTING", routing)
+    run = _load_module("benchmark_run_claude_env", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    run_home = tmp_path / "home"
+    workdir.mkdir()
+    run_home.mkdir()
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO('{"type":"system","memory_paths":{}}\n')
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            raise AssertionError("process should not be killed")
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    for key in run.CLAUDE_MODEL_OVERRIDE_KEYS:
+        monkeypatch.setenv(key, "stale-host-override")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(run.subprocess, "Popen", fake_popen)
+
+    result = run.run_agent(
+        "write output.csv",
+        "claude",
+        workdir,
+        model="sonnet",
+        run_home=run_home if managed_home else None,
+    )
+
+    assert result["returncode"] == 0
+    env = captured["kwargs"]["env"]
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    if managed_home:
+        assert env["HOME"] == str(run_home)
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == "claude-sonnet-4-6"
+    expected = (
+        {key: "claude-sonnet-4-6" for key in run.CLAUDE_MODEL_OVERRIDE_KEYS}
+        if routing == "single-model"
+        else {}
+    )
+    assert {
+        key: env[key] for key in run.CLAUDE_MODEL_OVERRIDE_KEYS if key in env
+    } == expected
+    assert run._claude_model_metadata("sonnet") == {
+        "claude_model_routing": routing,
+        "claude_observed_models": None,
+        "claude_model_overrides": expected,
+    }
+
+
+def test_validate_claude_memory_paths_requires_run_home(tmp_path):
+    run = _load_module("benchmark_run_claude_memory", "benchmark/run.py")
+
+    run_home = tmp_path / "home"
+    run_home.mkdir()
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "memory_paths": {
+                    "auto": str(run_home / ".claude" / "projects" / "x" / "memory")
+                },
+            }
+        )
+        + "\n"
+    )
+
+    result = run._validate_claude_memory_paths(trace, run_home)
+
+    assert result["validated"] is True
+    assert result["violations"] == []
+
+
+def test_validate_claude_memory_paths_flags_persistent_auth_escape(tmp_path):
+    run = _load_module("benchmark_run_claude_memory_escape", "benchmark/run.py")
+
+    run_home = tmp_path / "home"
+    run_home.mkdir()
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        '{"type":"system","memory_paths":{"auto":"/claude-auth/.claude/projects/x/memory"}}\n'
+    )
+
+    result = run._validate_claude_memory_paths(trace, run_home)
+
+    assert result["validated"] is False
+    assert result["violations"] == ["/claude-auth/.claude/projects/x/memory"]
+
+
+def test_codex_run_home_keeps_shell_writes_in_workdir(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_codex_env", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    run_home = tmp_path / "home"
+    workdir.mkdir()
+    (run_home / ".codex").mkdir(parents=True)
+    (run_home / ".codex" / "auth.json").write_text("{}")
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO('{"type":"turn.completed","usage":{}}\n')
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            raise AssertionError("process should not be killed")
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(run.subprocess, "Popen", fake_popen)
+
+    result = run.run_agent(
+        "write ./output.csv",
+        "codex",
+        workdir,
+        model="gpt-5.4-mini",
+        run_home=run_home,
+    )
+
+    env = captured["kwargs"]["env"]
+    assert result["returncode"] == 0
+    assert captured["kwargs"]["cwd"] == str(workdir)
+    assert env["HOME"] == str(workdir)
+    assert env["CODEX_HOME"] == str(workdir / ".codex")
+    assert env["TMPDIR"] == str(run_home / "tmp")
+    assert captured["cmd"][captured["cmd"].index("-C") + 1] == str(workdir)
+    assert (workdir / ".codex" / "auth.json").read_text() == "{}"
+    assert (workdir / "trace.jsonl").exists()
+
+
+def test_agent_process_env_filters_host_environment(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_env_filter", "benchmark/run.py")
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("CODEX_API_KEY", "codex-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test")
+
+    claude_env = run._agent_process_env("claude", tmp_path / "work", tmp_path / "home")
+    codex_env = run._agent_process_env("codex", tmp_path / "work", tmp_path / "home")
+    gemini_env = run._agent_process_env("gemini", tmp_path / "work", tmp_path / "home")
+
+    assert claude_env["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    assert "OPENAI_API_KEY" not in claude_env
+    assert codex_env["CODEX_API_KEY"] == "codex-test"
+    assert codex_env["OPENAI_API_KEY"] == "sk-openai-test"
+    assert "ANTHROPIC_API_KEY" not in codex_env
+    assert gemini_env["GOOGLE_API_KEY"] == "google-test"
+    assert gemini_env["GEMINI_API_KEY"] == "gemini-test"
+    assert "ANTHROPIC_API_KEY" not in gemini_env
+    for env in (claude_env, codex_env, gemini_env):
+        assert "HTTP_PROXY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+
+
+def test_agent_process_env_pins_direct_claude_run_to_canonical_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("M4BENCH_CLAUDE_MODEL_ROUTING", "single-model")
+    run = _load_module("benchmark_run_direct_claude_model", "benchmark/run.py")
+
+    env = run._agent_process_env(
+        "claude",
+        tmp_path / "work",
+        tmp_path / "home",
+        model="opus",
+    )
+
+    assert {env[key] for key in run.CLAUDE_MODEL_OVERRIDE_KEYS} == {"claude-opus-4-7"}
+    assert run._claude_model_overrides("opus") == {
+        key: "claude-opus-4-7" for key in run.CLAUDE_MODEL_OVERRIDE_KEYS
+    }
+    assert run._resolve_model_for_agent("claude", None) == "claude-sonnet-4-6"
+
+
+def test_agent_process_env_uses_container_paths(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_container_env", "benchmark/run.py")
+
+    monkeypatch.setenv("M4BENCH_AGENT_CONTAINER", "1")
+    monkeypatch.setenv("PATH", "/host/bin")
+    monkeypatch.setenv("SSL_CERT_FILE", "/host/cert.pem")
+
+    env = run._agent_process_env("claude", tmp_path / "work", tmp_path / "home")
+
+    assert env["PATH"].startswith("/usr/local/sbin:")
+    assert env["SHELL"] == "/bin/bash"
+    assert "SSL_CERT_FILE" not in env
+
+
+def test_agent_container_command_mounts_only_agent_inputs(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_container_cmd", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    run_home = tmp_path / "home"
+    workdir.mkdir()
+    run_home.mkdir()
+    monkeypatch.setenv("M4BENCH_AGENT_CONTAINER_IMAGE", "m4bench:test")
+    monkeypatch.setenv("M4BENCH_DOCKER_BIN", "docker-test")
+    monkeypatch.setenv("M4BENCH_M4_DATA_DIR", str(tmp_path / "m4_data"))
+    monkeypatch.setenv(
+        "M4BENCH_AGENT_CONTAINER_MOUNTS",
+        f"{tmp_path / 'm4_data' / 'parquet' / 'mimic-iv'}=/m4_data/parquet/mimic-iv\n",
+    )
+
+    cmd = run._agent_container_command(
+        ["bash", "-lc", "echo ok"],
+        env={"HOME": str(run_home), "PATH": run.CONTAINER_PATH},
+        workdir=workdir,
+        run_home=run_home,
+    )
+    joined = "\n".join(cmd)
+
+    assert "docker-test" == cmd[0]
+    assert f"{workdir}:{workdir}:rw" in cmd
+    assert f"{run_home}:{run_home}:rw" in cmd
+    assert "/m4_data/parquet/mimic-iv:ro" in joined
+    assert ":/benchmark" not in joined
+    assert "benchmark/ground_truth" not in joined
+    assert "benchmark/tasks" not in joined
+    assert "benchmark/agent_db" not in joined
+
+
+def test_agent_container_allows_host_visible_m4_data_mount(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_container_host_data_mount", "benchmark/run.py")
+
+    data_root = tmp_path / "m4_data"
+    source = data_root / "parquet" / "mimic-iv"
+    source.mkdir(parents=True)
+    monkeypatch.setenv("M4BENCH_M4_DATA_DIR", str(data_root))
+    monkeypatch.setenv(
+        "M4BENCH_AGENT_CONTAINER_MOUNTS",
+        f"{source}={source}\n",
+    )
+
+    assert run._agent_container_extra_mounts() == [(str(source.resolve()), str(source))]
+
+
+def test_db_cache_file_lock_creates_private_lock_file(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_db_cache_lock", "benchmark/run.py")
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(run, "DB_CACHE", cache_dir)
+
+    with run._db_cache_file_lock("example.duckdb"):
+        lock_path = cache_dir / "example.duckdb.lock"
+        assert lock_path.exists()
+        assert lock_path.stat().st_mode & 0o077 == 0
+
+
+def test_agent_container_command_writes_api_keys_to_secret_env_file(
+    monkeypatch, tmp_path
+):
+    run = _load_module("benchmark_run_container_secret_env", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    run_home = tmp_path / "home"
+    workdir.mkdir()
+    run_home.mkdir()
+    monkeypatch.setenv("M4BENCH_M4_DATA_DIR", str(tmp_path / "m4_data"))
+
+    cmd = run._agent_container_command(
+        ["claude", "-p", "ok"],
+        env={
+            "HOME": str(run_home),
+            "PATH": run.CONTAINER_PATH,
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+        },
+        workdir=workdir,
+        run_home=run_home,
+    )
+    joined = "\n".join(cmd)
+    secret_env_file = run_home / ".m4bench" / "agent_env.sh"
+
+    assert secret_env_file.exists()
+    assert "ANTHROPIC_API_KEY=sk-ant-test" in secret_env_file.read_text()
+    assert "ANTHROPIC_API_KEY=sk-ant-test" not in joined
+    assert f"M4BENCH_AGENT_ENV_FILE={secret_env_file}" in joined
+
+
+def test_agent_container_rejects_unapproved_extra_mounts(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_container_mount_validation", "benchmark/run.py")
+
+    monkeypatch.setenv(
+        "M4BENCH_AGENT_CONTAINER_MOUNTS",
+        f"{tmp_path / 'repo'}=/workspace/repo\n",
+    )
+
+    try:
+        run._agent_container_extra_mounts()
+    except RuntimeError as exc:
+        assert "host mount outside M4 data root" in str(exc)
+    else:
+        raise AssertionError("expected invalid host mount to fail")
+
+
+def test_agent_container_rejects_broad_data_root(monkeypatch):
+    run = _load_module("benchmark_run_container_broad_root", "benchmark/run.py")
+
+    monkeypatch.setenv("M4BENCH_M4_DATA_DIR", "/")
+
+    try:
+        run._agent_container_extra_mounts()
+    except RuntimeError as exc:
+        assert "M4 data root must be a directory named m4_data" in str(exc)
+    else:
+        raise AssertionError("expected broad data root to fail")
+
+
+def test_agent_container_mounts_claude_login_auth_for_root_copy_only(
+    monkeypatch, tmp_path
+):
+    run = _load_module("benchmark_run_container_claude_auth_cmd", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    run_home = tmp_path / "home"
+    workdir.mkdir()
+    run_home.mkdir()
+
+    cmd = run._agent_container_command(
+        ["claude", "-p", "ok"],
+        env={
+            "HOME": str(run_home),
+            "PATH": run.CONTAINER_PATH,
+            "M4BENCH_CLAUDE_AUTH_ROOT": "/claude-auth",
+            "M4BENCH_CLAUDE_AUTH_VOLUME": "m4bench-claude-auth",
+        },
+        workdir=workdir,
+        run_home=run_home,
+    )
+    joined = "\n".join(cmd)
+
+    assert "m4bench-claude-auth:/claude-auth:rw" in cmd
+    assert 'cp "$auth_root/$rel" "$M4BENCH_CONTAINER_HOME/$rel"' in joined
+    assert 'cp "$M4BENCH_CONTAINER_HOME/$rel" "$auth_root/$rel"' in joined
+    assert 'chmod -R go-rwx "$auth_root"' in joined
+
+
+def test_run_agent_timeout_kills_process_group(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_timeout", "benchmark/run.py")
+
+    captured = {}
+    killpg_calls = []
+
+    class SlowProcess:
+        pid = 4242
+        stdout = io.StringIO("")
+        returncode = None
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired(["agent"], timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            raise AssertionError("process group kill should be used")
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return SlowProcess()
+
+    def fake_killpg(pid, sig):
+        killpg_calls.append((pid, sig))
+
+    monkeypatch.setattr(run.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(run.os, "killpg", fake_killpg)
+
+    result = run.run_agent("write output.csv", "gemini", tmp_path)
+
+    assert result["returncode"] == -1
+    assert result["stderr"] == "TIMEOUT after 30 minutes"
+    assert result["elapsed_seconds"] < 10
+    assert captured["kwargs"]["start_new_session"] is True
+    assert killpg_calls == [
+        (4242, run.signal.SIGTERM),
+        (4242, run.signal.SIGKILL),
+    ]
+
+
+def test_resolve_results_root_uses_override(tmp_path):
+    run = _load_module("benchmark_run_results_root", "benchmark/run.py")
+
+    resolved = run.resolve_results_root(str(tmp_path / "paper-run"))
+    assert resolved == (tmp_path / "paper-run").resolve()
+
+
+def test_trial_numbers_start_at_requested_trial():
+    run = _load_module("benchmark_run_trials", "benchmark/run.py")
+
+    assert run._trial_numbers(3, 2) == [3, 4]
+
+
+def test_bench_sh_handles_empty_mount_array_with_bash_nounset(tmp_path):
+    fake_docker = tmp_path / "docker"
+    docker_log = tmp_path / "docker.log"
+    fake_docker.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [[ "${1:-}" == "context" && "${2:-}" == "show" ]]; then
+    echo default
+    exit 0
+fi
+if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
+    exit 0
+fi
+if [[ "${1:-}" == "ps" ]]; then
+    exit 0
+fi
+exit 0
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "DOCKER_BIN": str(fake_docker),
+        "FAKE_DOCKER_LOG": str(docker_log),
+        "HOME": str(tmp_path / "home"),
+        "M4BENCH_CONTAINER_NAME": "m4bench-test",
+        "M4BENCH_M4_DATA_DIR": str(tmp_path / "m4_data"),
+        "M4BENCH_BENCH_SH_NO_RUN": "1",
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            "benchmark/bench.sh",
+            "--task",
+            "eicu-gcs",
+            "--condition",
+            "with-skill",
+            "--agent",
+            "codex",
+            "--results-root",
+            "/benchmark/results/fake",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "unbound variable" not in result.stderr
+    assert "Running host orchestrator with agent-only Docker isolation" in result.stdout
+
+
+def test_codex_command_disables_plugins():
+    run = _load_module("benchmark_run_codex_cmd", "benchmark/run.py")
+
+    codex_cmd = run.AGENT_COMMANDS["codex"]["cmd"]
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex_cmd
+    assert "--disable" in codex_cmd
+    assert "plugins" in codex_cmd
+    assert 'web_search="disabled"' in codex_cmd
+    assert "tools.web_search=false" in codex_cmd
+    assert 'sandbox_mode="workspace-write"' in codex_cmd
+
+
+def test_rewrite_m4_data_sql_path_points_at_container_mount():
+    run = _load_module("benchmark_run_rewrite_sql", "benchmark/run.py")
+
+    sql = (
+        "CREATE VIEW patient AS SELECT * FROM "
+        "read_parquet('/Users/example/m4_data/parquet/eicu/patient.parquet');"
+    )
+
+    rewritten = run._rewrite_m4_data_sql_path(sql, "/m4_data")
+
+    assert "/Users/example/m4_data" not in rewritten
+    assert "read_parquet('/m4_data/parquet/eicu/patient.parquet')" in rewritten
+
+
+def test_detect_external_tool_use_flags_web_search(tmp_path):
+    run = _load_module("benchmark_run_external_tools", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"type":"item.started","item":{"type":"web_search","id":"x"}}\n')
+
+    assert run._detect_external_tool_use(trace) == ["web_search"]
+
+
+def test_detect_external_tool_use_flags_shell_network_attempt(tmp_path):
+    run = _load_module("benchmark_run_external_shell", "benchmark/run.py")
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        'python3 -c "from urllib.request import urlopen; '
+                        "urlopen('https://example.com')\""
+                    ),
+                },
+            }
+        )
+        + "\n"
+    )
+
+    assert run._detect_external_tool_use(trace) == ["external_network_command"]
+
+
+def test_gemini_command_uses_external_sandbox():
+    run = _load_module("benchmark_run_gemini_cmd", "benchmark/run.py")
+
+    gemini_cmd = run.AGENT_COMMANDS["gemini"]["cmd"]
+
+    assert "--sandbox" not in gemini_cmd
+    assert "--approval-mode" in gemini_cmd
+    assert "yolo" in gemini_cmd
+    assert "--skip-trust" in gemini_cmd
+
+
+def test_copy_results_back_filters_database_and_auth_artifacts(tmp_path):
+    run = _load_module("benchmark_run_copy_filters", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    results = tmp_path / "results"
+    workdir.mkdir()
+    (workdir / "output.csv").write_text("stay_id,score\n1,2\n")
+    (workdir / "database.duckdb").write_text("db")
+    (workdir / "scratch.sqlite").write_text("db")
+    (workdir / ".codex").mkdir()
+    (workdir / ".codex" / "auth.json").write_text("{}")
+    (workdir / "nested").mkdir()
+    (workdir / "nested" / "copy.duckdb").write_text("db")
+    (workdir / "nested" / "notes.txt").write_text("ok")
+
+    run.copy_results_back(workdir, results)
+
+    assert (results / "output.csv").exists()
+    assert (results / "nested" / "notes.txt").exists()
+    assert not (results / "database.duckdb").exists()
+    assert not (results / "scratch.sqlite").exists()
+    assert not (results / ".codex").exists()
+    assert not (results / "nested" / "copy.duckdb").exists()
+
+
+def test_reset_workdir_for_retry_removes_stale_outputs(tmp_path):
+    run = _load_module("benchmark_run_retry_reset", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "database.duckdb").write_text("db")
+    (workdir / "instruction.md").write_text("instruction")
+    (workdir / "output.csv").write_text("stale")
+    (workdir / "scratch").mkdir()
+    (workdir / "scratch" / "x.txt").write_text("stale")
+    (workdir / ".claude").mkdir()
+
+    run._reset_workdir_for_retry(workdir)
+
+    assert (workdir / "database.duckdb").exists()
+    assert (workdir / "instruction.md").exists()
+    assert (workdir / ".claude").exists()
+    assert not (workdir / "output.csv").exists()
+    assert not (workdir / "scratch").exists()
+
+
+def test_lint_run_contamination_flags_sensitive_paths(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_contamination_lint", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "output.csv").write_text("stay_id,score\n1,2\n")
+    (workdir / "trace.jsonl").write_text("cat /benchmark/ground_truth/answer.csv\n")
+    monkeypatch.setattr(run, "_sha256_file", lambda path: str(path))
+
+    result = run.lint_run_contamination(
+        workdir,
+        "mimic-sirs-24h",
+        run_id="current",
+        prior_run_ids={"old-run"},
+    )
+
+    assert not result["passed"]
+    assert any("/benchmark/ground_truth" in item for item in result["violations"])
+
+
+def _stub_ground_truth(monkeypatch, tmp_path):
+    import evaluate
+
+    ground_truth = tmp_path / "ground_truth.csv"
+    ground_truth.write_text("stay_id,score\n1,3\n")
+    monkeypatch.setattr(evaluate, "resolve_ground_truth", lambda _task: ground_truth)
+    return ground_truth
+
+
+def test_lint_run_contamination_allows_codex_auth_seed(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_contamination_lint_auth", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / ".codex").mkdir()
+    (workdir / ".codex" / "auth.json").write_text(
+        '{"tokens": {"access_token": "abcdefghijklmnopqrstuvwxyz"}}\n'
+    )
+    (workdir / "output.csv").write_text("stay_id,score\n1,2\n")
+    _stub_ground_truth(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "_sha256_file", lambda path: str(path))
+
+    result = run.lint_run_contamination(
+        workdir,
+        "mimic-sirs-24h",
+        run_id="current",
+    )
+
+    assert result["passed"], result["violations"]
+
+
+def test_lint_run_contamination_ignores_harness_runtime_files(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_contamination_lint_harness", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / ".m4bench").mkdir()
+    (workdir / ".m4bench" / "sandbox_hook.py").write_text("/benchmark/ground_truth\n")
+    (workdir / ".codex").mkdir()
+    (workdir / ".codex" / "state.sqlite").write_text("sqlite")
+    (workdir / "output.csv").write_text("stay_id,score\n1,2\n")
+    _stub_ground_truth(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "_sha256_file", lambda path: str(path))
+
+    result = run.lint_run_contamination(
+        workdir,
+        "mimic-sirs-24h",
+        run_id="current",
+    )
+
+    assert result["passed"], result["violations"]
+
+
+def test_lint_run_contamination_still_flags_non_auth_secrets(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_contamination_lint_secret", "benchmark/run.py")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "notes.json").write_text(
+        '{"access_token": "abcdefghijklmnopqrstuvwxyz"}\n'
+    )
+    (workdir / "output.csv").write_text("stay_id,score\n1,2\n")
+    monkeypatch.setattr(run, "_sha256_file", lambda path: str(path))
+
+    result = run.lint_run_contamination(
+        workdir,
+        "mimic-sirs-24h",
+        run_id="current",
+    )
+
+    assert not result["passed"]
+    assert any("contains token-shaped secret" in item for item in result["violations"])
+
+
+def test_sanitize_test_results_removes_truth_examples_and_sensitive_paths():
+    run = _load_module("benchmark_run_result_sanitizer", "benchmark/run.py")
+
+    test_results = {
+        "reward": 0.5,
+        "pytest_output": (
+            "score failed. Examples: [{'stay_id': 1, 'score_truth': 7}]\n"
+            "GROUND_TRUTH_PATH=/benchmark/ground_truth/score.csv.gz"
+        ),
+        "pytest_stderr": "see ground_truth.csv",
+    }
+
+    sanitized = run.sanitize_test_results_for_storage(test_results)
+
+    assert sanitized["reward"] == 0.5
+    assert "score_truth" not in sanitized["pytest_output"]
+    assert "Examples: [redacted]" in sanitized["pytest_output"]
+    assert "/benchmark/ground_truth" not in sanitized["pytest_output"]
+    assert "ground_truth.csv" not in sanitized["pytest_stderr"]
+
+
+def test_pi_ollama_command_disables_context_discovery():
+    run = _load_module("benchmark_run_pi_ollama_cmd", "benchmark/run.py")
+
+    pi_cmd = run.AGENT_COMMANDS["pi-ollama"]["cmd"]
+
+    assert pi_cmd[0] == "pi"
+    assert pi_cmd[-1] == "-p"
+    assert "--no-context-files" in pi_cmd
+    assert "--no-themes" in pi_cmd
+    assert "--no-prompt-templates" in pi_cmd
+    assert "--no-extensions" in pi_cmd
+    assert "--provider" in pi_cmd
+    assert "ollama" in pi_cmd
+    assert ".pi/skills" in pi_cmd
+
+
+def test_pi_ollama_model_flag_precedes_prompt_flag(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_pi_ollama_model_cmd", "benchmark/run.py")
+    seen: dict[str, list[str]] = {}
+
+    class FakeProcess:
+        returncode = 0
+        stdout = iter(["ok\n"])
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return FakeProcess()
+
+    monkeypatch.setattr(run.subprocess, "Popen", fake_popen)
+
+    result = run.run_agent(
+        "double the scores",
+        "pi-ollama",
+        tmp_path,
+        model="qwen3:4b",
+    )
+
+    cmd = seen["cmd"]
+    assert result["returncode"] == 0
+    assert cmd[-2:] == ["-p", "double the scores"]
+    assert cmd[cmd.index("--model") + 1] == "qwen3:4b"
+    assert cmd.index("--model") < cmd.index("-p")
+
+
+def test_prepare_run_home_pi_ollama_seeds_only_models_json(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_pi_home", "benchmark/run.py")
+
+    auth_root = tmp_path / "auth"
+    (auth_root / ".pi" / "agent").mkdir(parents=True)
+    (auth_root / ".pi" / "agent" / "models.json").write_text("{}")
+    (auth_root / ".pi" / "agent" / "auth.json").write_text("{}")
+
+    monkeypatch.setenv("M4BENCH_AUTH_ROOT", str(auth_root))
+
+    pi_home = tmp_path / "pi-home"
+    copied = run.prepare_run_home("pi-ollama", pi_home)
+
+    assert copied == [".pi/agent/models.json"]
+    assert (pi_home / ".pi" / "agent" / "models.json").exists()
+    assert not (pi_home / ".pi" / "agent" / "auth.json").exists()
+
+
+def test_prepare_run_home_pi_ollama_rewrites_docker_ollama_url(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_pi_home_ollama_url", "benchmark/run.py")
+
+    auth_root = tmp_path / "auth"
+    models_path = auth_root / ".pi" / "agent" / "models.json"
+    models_path.parent.mkdir(parents=True)
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "ollama": {
+                        "baseUrl": "http://localhost:11434/v1",
+                        "api": "openai-completions",
+                        "apiKey": "ollama",
+                        "models": [{"id": "qwen3:4b"}],
+                    }
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv("M4BENCH_AUTH_ROOT", str(auth_root))
+    monkeypatch.setenv(
+        "M4BENCH_OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"
+    )
+
+    pi_home = tmp_path / "pi-home"
+    run.prepare_run_home("pi-ollama", pi_home)
+
+    copied = json.loads((pi_home / ".pi" / "agent" / "models.json").read_text())
+    assert (
+        copied["providers"]["ollama"]["baseUrl"]
+        == "http://host.docker.internal:11434/v1"
+    )
+
+
+def test_reasoning_auto_policy_resolves_by_agent():
+    run = _load_module("benchmark_run_reasoning_policy", "benchmark/run.py")
+
+    assert run._resolve_reasoning_effort("codex", "auto") == "medium"
+    assert run._resolve_reasoning_effort("claude", "auto") == "medium"
+    assert run._resolve_reasoning_effort("gemini", "auto") == "provider-default"
+    assert run._resolve_reasoning_effort("pi-ollama", "auto") == "provider-default"
+
+
+def test_reasoning_args_match_supported_agent_clis():
+    run = _load_module("benchmark_run_reasoning_args", "benchmark/run.py")
+
+    assert run._reasoning_args_for_agent("codex", "medium") == [
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+    assert run._reasoning_args_for_agent("claude", "medium") == [
+        "--effort",
+        "medium",
+    ]
+    assert run._reasoning_args_for_agent("gemini", "provider-default") == []
+    assert run._reasoning_args_for_agent("pi-ollama", "provider-default") == []
+
+
+def test_named_reasoning_rejects_unsupported_agent_scale():
+    run = _load_module("benchmark_run_reasoning_invalid", "benchmark/run.py")
+
+    try:
+        run._resolve_reasoning_effort("gemini", "high")
+    except ValueError as exc:
+        assert "does not support named reasoning effort" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for Gemini named effort")
+
+    try:
+        run._resolve_reasoning_effort("pi-ollama", "high")
+    except ValueError as exc:
+        assert "does not support named reasoning effort" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for pi-ollama named effort")
+
+
+def test_network_lock_allows_codex_api_and_subscription_hosts():
+    script = (ROOT / "benchmark" / "network_lock.sh").read_text()
+
+    assert "api.openai.com" in script
+    assert "auth.openai.com" in script
+    assert "chatgpt.com" in script
+    assert ".chatgpt.com" in script
+
+
+def test_egress_lint_allows_chatgpt_subscription_subdomains(tmp_path):
+    run = _load_module("benchmark_run_egress_chatgpt_subdomains", "benchmark/run.py")
+
+    (tmp_path / "egress.jsonl").write_text(
+        '{"allowed": true, "host": "ab.chatgpt.com", "port": 443}\n'
+    )
+
+    assert run._detect_disallowed_egress(tmp_path) == []
+
+
+def test_network_lock_allows_gemini_code_assist_host():
+    script = (ROOT / "benchmark" / "network_lock.sh").read_text()
+
+    assert "cloudcode-pa.googleapis.com" in script
+    assert "oauth2.googleapis.com" in script
+    assert "play.googleapis.com" in script
+
+
+def test_network_lock_allows_claude_runtime_hosts():
+    script = (ROOT / "benchmark" / "network_lock.sh").read_text()
+
+    assert "api.anthropic.com" in script
+    assert "mcp-proxy.anthropic.com" in script
+    assert "platform.claude.com" in script
+    assert "http-intake.logs.us5.datadoghq.com" in script
+
+
+def test_network_lock_allows_configured_ollama_for_pi():
+    script = (ROOT / "benchmark" / "network_lock.sh").read_text()
+
+    assert "M4BENCH_ALLOW_OLLAMA" in script
+    assert "M4BENCH_OLLAMA_HOST" in script
+    assert "M4BENCH_OLLAMA_PORT" in script
+    assert '--dport "$OLLAMA_PORT"' in script
+
+
+def test_network_lock_blocks_ipv6_egress():
+    script = (ROOT / "benchmark" / "network_lock.sh").read_text()
+
+    assert "ip6tables" in script
+    assert 'ip6tables -A OUTPUT -m owner --uid-owner "$AGENT_UID" -j REJECT' in script
+
+
+def test_benchmark_dockerfile_installs_pi_cli():
+    dockerfile = (ROOT / "benchmark" / "Dockerfile").read_text()
+
+    assert "PI_CODING_AGENT_VERSION=0.70.2" in dockerfile
+    assert "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" in dockerfile
+
+
+def test_bench_sh_stages_pi_config_and_configures_ollama_endpoint():
+    bench = (ROOT / "benchmark" / "bench.sh").read_text()
+
+    assert 'AGENT" == "pi-ollama"' in bench
+    assert "command -v pi" in bench
+    assert "M4BENCH_OLLAMA_BASE_URL" in bench
+    assert (
+        "--add-host=host.docker.internal:host-gateway"
+        in (ROOT / "benchmark" / "run.py").read_text()
+    )
+    assert 'stage_auth_file ".pi/agent/models.json"' in bench
+    assert "$HOME/.pi:$AUTH_ROOT/.pi:ro" not in bench
+
+
+def test_bench_sh_stages_minimal_auth_instead_of_full_provider_dirs():
+    bench = (ROOT / "benchmark" / "bench.sh").read_text()
+
+    assert "AUTH_STAGING_DIR=" in bench
+    assert 'stage_auth_file ".codex/auth.json"' in bench
+    assert 'stage_auth_file ".gemini/oauth_creds.json"' in bench
+    assert 'chmod -R go-rwx "$AUTH_STAGING_DIR"' in bench
+    assert "$HOME/.codex:$AUTH_ROOT/.codex:ro" not in bench
+    assert "$HOME/.gemini:$AUTH_ROOT/.gemini:ro" not in bench
+    assert "$HOME/.pi:$AUTH_ROOT/.pi:ro" not in bench
+
+
+def test_bench_sh_can_skip_per_run_preflight_after_campaign_preflight():
+    bench = (ROOT / "benchmark" / "bench.sh").read_text()
+
+    assert "M4BENCH_SKIP_PREFLIGHT" in bench
+    assert "Skipping per-run preflight checks" in bench
+    assert "campaign preflight already passed" in bench
+
+
+def test_bench_sh_supports_claude_login_volume():
+    bench = (ROOT / "benchmark" / "bench.sh").read_text()
+
+    assert "M4BENCH_CLAUDE_AUTH_MODE" not in bench
+    assert "m4bench-claude-auth" in bench
+    assert 'M4BENCH_CLAUDE_AUTH_ROOT="$CLAUDE_AUTH_ROOT"' in bench
+    assert 'M4BENCH_CLAUDE_AUTH_VOLUME="$CLAUDE_AUTH_VOLUME"' in bench
+
+
+def test_bench_sh_claude_login_does_not_require_api_key(tmp_path):
+    fake_docker = tmp_path / "docker"
+    docker_log = tmp_path / "docker.log"
+    fake_docker.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [[ "${1:-}" == "context" && "${2:-}" == "show" ]]; then
+    echo default
+    exit 0
+fi
+if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
+    exit 0
+fi
+if [[ "${1:-}" == "ps" ]]; then
+    exit 0
+fi
+exit 0
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "DOCKER_BIN": str(fake_docker),
+        "FAKE_DOCKER_LOG": str(docker_log),
+        "HOME": str(tmp_path / "home"),
+        "M4BENCH_CONTAINER_NAME": "m4bench-test",
+        "M4BENCH_M4_DATA_DIR": str(tmp_path / "m4_data"),
+        "M4BENCH_BENCH_SH_NO_RUN": "1",
+    }
+    env.pop("ANTHROPIC_API_KEY", None)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "benchmark/bench.sh",
+            "--task",
+            "mimic-sirs-24h-raw",
+            "--condition",
+            "no-skill",
+            "--agent",
+            "claude",
+            "--results-root",
+            "/benchmark/results/fake",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    log = docker_log.read_text()
+    assert "Using Claude login auth volume: m4bench-claude-auth" in result.stdout
+    assert "Running host orchestrator with agent-only Docker isolation" in result.stdout
+    assert "ANTHROPIC_API_KEY" not in log
+
+
+def test_claude_login_container_script_persists_allowlisted_auth_only():
+    script = (ROOT / "benchmark" / "claude_login_container.sh").read_text()
+
+    assert "claude login" in script
+    assert "M4BENCH_CLAUDE_LOGIN_CONTAINER" in script
+    assert "M4BENCH_CLAUDE_AUTH_MODE" not in script
+    assert '"$DOCKER_BIN" exec -it "$CLAUDE_LOGIN_CONTAINER"' in script
+    assert ".claude.json" in script
+    assert ".claude/.credentials.json" in script
+    assert ".claude/projects" not in script
+    assert "chmod -R go-rwx /claude-auth" in script
+    assert "claude-ok" in script
+
+
+def test_task_discovery_uses_repo_relative_paths(monkeypatch):
+    monkeypatch.chdir(ROOT / "benchmark")
+    db = _load_module("benchmark_db_paths", "benchmark/lib/db.py")
+
+    task_dirs = db.list_task_dirs()
+
+    assert task_dirs
+    assert task_dirs[0].is_absolute()
+    assert (task_dirs[0] / "task.toml").exists()
+
+
+def test_publishable_environment_requires_container_and_agent_user(monkeypatch):
+    run = _load_module("benchmark_run_publishable", "benchmark/run.py")
+
+    monkeypatch.setenv("M4BENCH_AGENT_CONTAINER", "1")
+    assert run._publishable_environment(True) == (
+        True,
+        "agent-only Docker isolation active",
+    )
+    monkeypatch.delenv("M4BENCH_AGENT_CONTAINER")
+    ok, reason = run._publishable_environment(True)
+    assert ok is False
+    assert reason == "agent-container isolation required"
+
+    monkeypatch.setenv("M4BENCH_AGENT_CONTAINER", "1")
+    monkeypatch.setenv("M4BENCH_ALLOW_OLLAMA", "1")
+    ok, reason = run._publishable_environment(True)
+    assert ok is False
+    assert reason == "local Ollama host exception enabled"
+
+
+# ── Agent user isolation ────────────────────────────────────────────────
+
+
+def test_resolve_agent_creds_returns_none_when_user_missing(monkeypatch):
+    """Outside Docker (no benchagent user), _resolve_agent_creds returns None."""
+    run = _load_module("benchmark_run_creds", "benchmark/run.py")
+
+    import pwd
+
+    original = pwd.getpwnam
+
+    def fake_getpwnam(name):
+        if name == "benchagent":
+            raise KeyError(name)
+        return original(name)
+
+    monkeypatch.setattr(pwd, "getpwnam", fake_getpwnam)
+    assert run._resolve_agent_creds() is None
+
+
+def test_chown_recursive(tmp_path):
+    """_chown_recursive changes ownership of all files and dirs."""
+    run = _load_module("benchmark_run_chown", "benchmark/run.py")
+
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "file.txt").write_text("data")
+
+    # Just verify it doesn't crash with current uid/gid
+    uid = os.getuid()
+    gid = os.getgid()
+    run._chown_recursive(tmp_path, uid, gid)
+
+    # Verify ownership
+    assert (tmp_path / "sub" / "file.txt").stat().st_uid == uid
+
+
+# ── CLI flag: isolation is default ──────────────────────────────────────
+
+
+def test_isolation_is_default():
+    """Verify --no-isolation is required to disable isolation."""
+    import argparse
+
+    # Simulate the parser creation from main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-isolation", action="store_true")
+    parser.add_argument("--isolated", action="store_true")
+
+    # Default: isolated
+    args = parser.parse_args([])
+    assert not args.no_isolation
+
+    # Explicit disable
+    args = parser.parse_args(["--no-isolation"])
+    assert args.no_isolation
+
+
+# ── Sandbox hook: blocked substrings ────────────────────────────────────
+
+
+def test_sandbox_hook_blocks_ground_truth_paths():
+    hook = _load_module("sandbox_hook_test", "benchmark/lib/sandbox_hook.py")
+
+    assert (
+        hook._check_blocked_substrings("/benchmark/ground_truth/sofa.csv") is not None
+    )
+    assert hook._check_blocked_substrings("cat ground_truth/foo.sql") is not None
+    assert hook._check_blocked_substrings("/benchmark/evaluate.py") is not None
+    assert hook._check_blocked_substrings("/benchmark/lib/compare.py") is not None
+    assert hook._check_blocked_substrings("/benchmark/tasks") is not None
+    assert hook._check_blocked_substrings("/host-auth/.codex/auth.json") is not None
+    assert hook._check_blocked_substrings("/claude-auth/.claude.json") is not None
+    assert hook._check_blocked_substrings("/benchmark/lib/dictionary.json") is not None
+    # Allowed paths should not trigger
+    assert hook._check_blocked_substrings("./output.csv") is None
+    assert hook._check_blocked_substrings("./database.duckdb") is None
+
+
+def test_filesystem_canary_covers_real_sensitive_paths():
+    run = _load_module("benchmark_run_canary_paths", "benchmark/run.py")
+
+    commands = "\n".join(cmd for _name, cmd in run.FILESYSTEM_CANARY_CHECKS)
+
+    assert "/benchmark/ground_truth" in commands
+    assert "/benchmark/tasks" in commands
+    assert "/benchmark/agent_db" in commands
+    assert "/tmp/clinskillsbench/_db_cache" in commands
+    assert "/host-auth" in commands
+    assert "/claude-auth" in commands
+    assert "/benchmark/lib/dictionary.json" in commands
+    assert "/private-benchmark" not in commands
+
+
+def test_leak_canary_report_requires_all_sensitive_paths():
+    run = _load_module("benchmark_run_leak_canary_report", "benchmark/run.py")
+
+    incomplete = {
+        "leak_found": False,
+        "probed_paths": ["/benchmark/ground_truth"],
+        "evidence": ["permission denied for /benchmark/ground_truth"],
+    }
+    complete = {
+        "leak_found": False,
+        "probed_paths": list(run.LEAK_CANARY_PATHS),
+        "evidence": [f"permission denied for {path}" for path in run.LEAK_CANARY_PATHS],
+    }
+
+    assert not run.validate_leak_canary_report(incomplete)["passed"]
+    assert run.validate_leak_canary_report(complete)["passed"]
+
+
+def test_nonisolated_claude_leak_canary_pins_command_env_and_metadata(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("M4BENCH_CLAUDE_MODEL_ROUTING", "single-model")
+    run = _load_module("benchmark_run_local_claude_canary", "benchmark/run.py")
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO('{"type":"result","subtype":"success"}\n')
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            raise AssertionError("process should not be killed")
+
+    def fake_prepare_run_home(_agent_name, run_home):
+        run_home.mkdir(parents=True)
+        return []
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        report = {
+            "leak_found": False,
+            "probed_paths": list(run.LEAK_CANARY_PATHS),
+            "evidence": [
+                f"permission denied for {path}" for path in run.LEAK_CANARY_PATHS
+            ],
+        }
+        (Path(kwargs["cwd"]) / "canary_report.json").write_text(json.dumps(report))
+        return FakeProcess()
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-leak")
+    monkeypatch.setattr(run, "prepare_run_home", fake_prepare_run_home)
+    monkeypatch.setattr(
+        run,
+        "run_filesystem_canary",
+        lambda *args, **kwargs: {
+            "passed": True,
+            "required": False,
+            "failures": [],
+        },
+    )
+    monkeypatch.setattr(run.subprocess, "Popen", fake_popen)
+
+    result = run.run_leak_canary(
+        "claude",
+        "sonnet",
+        verbose=False,
+        isolated=False,
+        results_root=tmp_path,
+    )
+
+    assert captured["cmd"][captured["cmd"].index("--model") + 1] == (
+        "claude-sonnet-4-6"
+    )
+    assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    assert "AWS_SECRET_ACCESS_KEY" not in captured["env"]
+    assert {captured["env"][key] for key in run.CLAUDE_MODEL_OVERRIDE_KEYS} == {
+        "claude-sonnet-4-6"
+    }
+    assert result["model"] == "claude-sonnet-4-6"
+    assert result["claude_model_overrides"] == {
+        key: "claude-sonnet-4-6" for key in run.CLAUDE_MODEL_OVERRIDE_KEYS
+    }
+    stored_result = json.loads(
+        next(tmp_path.glob("leak-canary_*/result.json")).read_text()
+    )
+    assert stored_result["model"] == "claude-sonnet-4-6"
+    assert stored_result["claude_model_overrides"] == result["claude_model_overrides"]
+
+
+def test_batch_metadata_uses_canonical_claude_model(monkeypatch, tmp_path):
+    run = _load_module("benchmark_run_claude_batch_metadata", "benchmark/run.py")
+    child_models = []
+
+    def fake_run_single_task(*args, **kwargs):
+        child_models.append(args[3])
+        return {
+            "task": args[0],
+            "condition": args[1],
+            "model": args[3],
+            "test_results": {"reward": 1.0},
+            "agent_result": {"elapsed_seconds": 0},
+        }
+
+    monkeypatch.setattr(run, "resolve_tasks", lambda _args: ["fake-task"])
+    monkeypatch.setattr(run, "run_single_task", fake_run_single_task)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark/run.py",
+            "--task",
+            "fake-task",
+            "--condition",
+            "no-skill",
+            "--agent",
+            "claude",
+            "--model",
+            "sonnet",
+            "--seeds",
+            "2",
+            "--no-isolation",
+            "--results-root",
+            str(tmp_path),
+        ],
+    )
+
+    run.main()
+
+    batch_path = next(tmp_path.glob("batch_*.json"))
+    batch = json.loads(batch_path.read_text())
+    assert child_models == ["claude-sonnet-4-6", "claude-sonnet-4-6"]
+    assert batch["model"] == "claude-sonnet-4-6"
+    assert batch["claude_model_overrides"] == {}
+    assert batch["claude_model_routing"] == "native"
+
+
+def test_sandbox_hook_extracts_quoted_paths():
+    hook = _load_module("sandbox_hook_paths", "benchmark/lib/sandbox_hook.py")
+
+    paths = hook.extract_paths_from_command("python3 -c \"open('/benchmark/foo')\"")
+    assert any("/benchmark/foo" in p for p in paths)
+
+
+# ── setup.py CLI ────────────────────────────────────────────────────────
+
+
+def test_setup_parser_allows_schema_with_all():
+    setup = _load_module("benchmark_setup_cli", "benchmark/setup.py")
+
+    parser = setup.build_parser()
+    args = parser.parse_args(["--schema", "obfuscated", "--all"])
+
+    assert args.schema == "obfuscated"
+    assert args.all is True
+
+
+def test_native_claude_routing_does_not_force_secondary_models(monkeypatch, tmp_path):
+    run = _load_module("benchmark_native_routing", "benchmark/run.py")
+    monkeypatch.delenv("M4BENCH_CLAUDE_MODEL_ROUTING", raising=False)
+    for key in run.CLAUDE_MODEL_OVERRIDE_KEYS:
+        monkeypatch.setenv(key, "stale-host-override")
+    env = run._agent_process_env("claude", tmp_path, tmp_path / "home", model="sonnet")
+    assert not set(run.CLAUDE_MODEL_OVERRIDE_KEYS).intersection(env)
+    metadata = run._claude_model_metadata("sonnet")
+    assert metadata["claude_model_routing"] == "native"
+    assert metadata["claude_model_overrides"] == {}
+    assert metadata["claude_observed_models"] is None
+
+
+def test_invalid_claude_routing_fails_before_invocation(monkeypatch):
+    run = _load_module("benchmark_invalid_routing", "benchmark/run.py")
+    monkeypatch.setenv("M4BENCH_CLAUDE_MODEL_ROUTING", "typo")
+    with pytest.raises(ValueError, match="M4BENCH_CLAUDE_MODEL_ROUTING"):
+        run._resolve_model_for_agent("claude", "sonnet")
+
+
+def test_claude_observed_models_come_from_trace_not_requested_model(
+    monkeypatch, tmp_path
+):
+    run = _load_module("benchmark_observed_models", "benchmark/run.py")
+    monkeypatch.delenv("M4BENCH_CLAUDE_MODEL_ROUTING", raising=False)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "model": "requested-only"}),
+                json.dumps(
+                    {"type": "assistant", "message": {"model": "claude-sonnet-4-6"}}
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"model": "claude-haiku-4-5-20251001"},
+                    }
+                ),
+                "incomplete line",
+                "null",
+            ]
+        )
+    )
+    result = run._claude_model_metadata("opus", trace)
+    assert result["claude_observed_models"] == [
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6",
+    ]
+    assert result["claude_model_overrides"] == {}

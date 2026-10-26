@@ -1,18 +1,42 @@
+import base64
+import errno
 import gzip
+import io
+import json
+import os
+import re
+from pathlib import Path
 from unittest import mock
 
 import duckdb
+import pytest
 import requests
+from rich.console import Console
+from rich.progress import Progress
 
 from m4.core.backends.duckdb import DuckDBBackend
-from m4.core.datasets import DatasetDefinition, Modality
+from m4.core.datasets import DatasetDefinition, DatasetRegistry, Modality
+from m4.core.images import ImageFiles
 from m4.data_io import (
     COMMON_USER_AGENT,
+    DatasetDownloadError,
+    PhysioNetCredentials,
     _create_duckdb_with_views,
+    _download_dataset_files,
     _scrape_urls_from_html_page,
     compute_parquet_dir_size,
+    conversion_out_of_reach,
     convert_csv_to_parquet,
+    download_dataset,
+    find_raw_root,
+    find_unconverted,
+    folders_without_tables,
     init_duckdb_from_parquet,
+    is_dataset_prepared,
+    mark_dataset_prepared,
+    raw_files_left_to_convert,
+    sql_table_name,
+    unfinished_conversion,
     verify_table_rowcount,
 )
 
@@ -87,6 +111,293 @@ def test_common_user_agent_header():
     assert "Mozilla/" in COMMON_USER_AGENT
 
 
+def test_download_dataset_uses_credentials_and_preserves_listing_layout(
+    tmp_path, monkeypatch
+):
+    class Response:
+        def __init__(self, content=b"", status_code=200, headers=None):
+            self.content = content
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.reason = "OK"
+
+        def iter_content(self, chunk_size=8192):
+            for index in range(0, len(self.content), chunk_size):
+                yield self.content[index : index + chunk_size]
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.auth = None
+
+        def head(self, url, **kwargs):
+            return Response(headers={"content-length": "9", "accept-ranges": "bytes"})
+
+        def get(self, url, **kwargs):
+            if url.endswith("/hosp/"):
+                return Response(
+                    b'<a href="admissions.csv.gz">admissions</a>',
+                    headers={"content-length": "9"},
+                )
+            if url.endswith("/icu/"):
+                return Response(b"", headers={"content-length": "0"})
+            return Response(b"csv-bytes", headers={"content-length": "9"})
+
+    sessions = []
+
+    def make_session():
+        session = Session()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr("m4.data_io.requests.Session", make_session)
+
+    credentials = PhysioNetCredentials(username="alice", password="secret")
+    ok = download_dataset("mimic-iv", tmp_path, credentials=credentials)
+
+    assert ok is True
+    assert (tmp_path / "hosp" / "admissions.csv.gz").read_bytes() == b"csv-bytes"
+    assert (sessions[0].auth.username, sessions[0].auth.password) == (
+        b"alice",
+        b"secret",
+    )
+
+
+def test_physionet_credentials_file_is_read_as_utf8_with_or_without_bom(tmp_path):
+    """Not in the system's code page, and as Windows editors save "UTF-8 with BOM"."""
+    login = json.dumps({"username": "alice", "password": "Grüße-€"}, ensure_ascii=False)
+    plain = tmp_path / "plain.json"
+    plain.write_bytes(login.encode("utf-8"))
+    with_bom = tmp_path / "with-bom.json"
+    with_bom.write_bytes(("﻿" + login).encode("utf-8"))
+
+    for path in (plain, with_bom):
+        assert PhysioNetCredentials.from_json_file(path).password == "Grüße-€"
+
+
+# ------------------------------------------------------------
+# Where a PhysioNet login may go
+#
+# These tests use the real requests session and replace the transport below
+# it, so nothing reaches a network. The login is made up.
+# ------------------------------------------------------------
+
+FAKE_LOGIN = PhysioNetCredentials(username="fake-user", password="FAKE-not-a-password")
+FAKE_AUTHORIZATION = "Basic " + base64.b64encode(
+    b"fake-user:FAKE-not-a-password"
+).decode("ascii")
+
+
+class _SessionWithoutEnvironment(requests.Session):
+    """A real session that ignores proxy settings and ~/.netrc, so that a test
+    neither reads the developer's setup nor looks any host name up."""
+
+    def __init__(self):
+        super().__init__()
+        self.trust_env = False
+
+
+class Wire:
+    """Stands in for the network: keeps what would be sent, answers from a script."""
+
+    def __init__(self, monkeypatch, answer):
+        self.sent = []
+        self._answer = answer
+        monkeypatch.setattr("m4.data_io.requests.Session", _SessionWithoutEnvironment)
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", self._send)
+
+    def _send(self, request, **kwargs):
+        self.sent.append(request)
+        status, headers, body = self._answer(request)
+        response = requests.Response()
+        response.status_code = status
+        response.headers.update(headers)
+        response._content = body
+        response._content_consumed = True
+        response.url = request.url
+        response.request = request
+        return response
+
+    def sent_to(self, prefix):
+        return [request for request in self.sent if request.url.startswith(prefix)]
+
+
+def test_physionet_credentials_never_show_the_password():
+    assert FAKE_LOGIN.password == "FAKE-not-a-password"
+    for shown in (
+        repr(FAKE_LOGIN),
+        str(FAKE_LOGIN),
+        f"{FAKE_LOGIN}",
+        f"{FAKE_LOGIN!r}",
+    ):
+        assert "FAKE-not-a-password" not in shown
+    assert "FAKE-not-a-password" not in repr({"credentials": [FAKE_LOGIN]})
+
+
+@pytest.mark.parametrize(
+    "listing_url",
+    [
+        "https://example.test/collect/",
+        "http://physionet.org/files/mimiciv/3.1/",
+        "https://physionet.org.example.test/files/mimiciv/3.1/",
+        "https://physionet.org@example.test/files/mimiciv/3.1/",
+        "https://physionet.org:8443/files/mimiciv/3.1/",
+        "https://www.physionet.org/files/mimiciv/3.1/",
+    ],
+)
+def test_login_is_refused_to_anything_but_physionet_over_https(
+    tmp_path, monkeypatch, listing_url
+):
+    wire = Wire(monkeypatch, lambda request: (200, {}, b""))
+
+    with pytest.raises(DatasetDownloadError) as refused:
+        _download_dataset_files(
+            "somewhere-else",
+            {"file_listing_url": listing_url},
+            tmp_path,
+            credentials=FAKE_LOGIN,
+        )
+
+    assert refused.value.code == "physionet_url_required"
+    assert "https://physionet.org/" in refused.value.message
+    assert "FAKE-not-a-password" not in refused.value.message
+    assert wire.sent == []
+
+
+def test_login_goes_to_physionet_and_a_link_elsewhere_is_refused(tmp_path, monkeypatch):
+    listing = "https://physionet.org/files/made-up/1.0/"
+
+    def answer(request):
+        if request.url == listing:
+            page = (
+                b'<a href="admissions.csv.gz">a</a>'
+                b'<a href="https://example.test/patients.csv.gz">b</a>'
+            )
+            return 200, {}, page
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    wire = Wire(monkeypatch, answer)
+
+    with pytest.raises(DatasetDownloadError) as refused:
+        _download_dataset_files(
+            "made-up", {"file_listing_url": listing}, tmp_path, credentials=FAKE_LOGIN
+        )
+
+    assert refused.value.code == "physionet_url_required"
+    assert "example.test" in refused.value.message
+    assert (tmp_path / "admissions.csv.gz").read_bytes() == b"csv-bytes"
+    assert len(wire.sent) == 3  # the listing, then HEAD and GET of the one file
+    assert wire.sent_to("https://physionet.org/") == wire.sent
+    assert {r.headers["Authorization"] for r in wire.sent} == {FAKE_AUTHORIZATION}
+
+
+# The user agents PhysioNet takes a login from, as physionet-build's
+# project/utility.py lists them. It ignores a login from any other client.
+PHYSIONET_HTTP_AUTH_USER_AGENT = re.compile("Wget/|libwfdb/")
+
+
+def _one_file_listing(listing):
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="admissions.csv.gz">a</a>'
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    return answer
+
+
+def test_a_login_is_sent_with_a_user_agent_physionet_reads_it_from(
+    tmp_path, monkeypatch
+):
+    listing = "https://physionet.org/files/made-up/1.0/"
+    wire = Wire(monkeypatch, _one_file_listing(listing))
+
+    _download_dataset_files(
+        "made-up", {"file_listing_url": listing}, tmp_path, credentials=FAKE_LOGIN
+    )
+
+    assert len(wire.sent) == 3
+    for request in wire.sent:
+        assert PHYSIONET_HTTP_AUTH_USER_AGENT.match(request.headers["User-Agent"])
+
+
+def test_a_non_ascii_login_is_sent_as_physionet_decodes_it(tmp_path, monkeypatch):
+    """As UTF-8, which physionet-build's check_http_auth decodes the header with."""
+    listing = "https://physionet.org/files/made-up/1.0/"
+    wire = Wire(monkeypatch, _one_file_listing(listing))
+    login = PhysioNetCredentials(username="fake-üser", password="FAKE-Grüße-€")
+
+    _download_dataset_files(
+        "made-up", {"file_listing_url": listing}, tmp_path, credentials=login
+    )
+
+    assert len(wire.sent) == 3
+    for request in wire.sent:
+        scheme, encoded = request.headers["Authorization"].split()
+        assert scheme == "Basic"
+        assert base64.b64decode(encoded).decode() == "fake-üser:FAKE-Grüße-€"
+
+
+def test_an_open_download_keeps_the_browser_user_agent(tmp_path, monkeypatch):
+    listing = "https://physionet.org/files/made-up/1.0/"
+    wire = Wire(monkeypatch, _one_file_listing(listing))
+
+    _download_dataset_files("made-up", {"file_listing_url": listing}, tmp_path)
+
+    assert {r.headers["User-Agent"] for r in wire.sent} == {COMMON_USER_AGENT}
+    assert all("Authorization" not in r.headers for r in wire.sent)
+
+
+def test_login_is_dropped_when_physionet_redirects_to_another_host(
+    tmp_path, monkeypatch
+):
+    listing = "https://physionet.org/files/made-up/1.0/"
+
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="admissions.csv.gz">a</a>'
+        if request.url.startswith("https://physionet.org/"):
+            return (
+                302,
+                {"location": "https://example.test/mirror/admissions.csv.gz"},
+                b"",
+            )
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    wire = Wire(monkeypatch, answer)
+
+    assert _download_dataset_files(
+        "made-up", {"file_listing_url": listing}, tmp_path, credentials=FAKE_LOGIN
+    )
+
+    elsewhere = wire.sent_to("https://example.test/")
+    assert len(elsewhere) == 2  # the redirected HEAD and GET
+    assert all("Authorization" not in request.headers for request in elsewhere)
+    for request in wire.sent_to("https://physionet.org/"):
+        assert request.headers["Authorization"] == FAKE_AUTHORIZATION
+
+
+def test_download_without_a_login_is_not_tied_to_physionet(tmp_path, monkeypatch):
+    listing = "https://example.test/open-data/"
+
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="table.csv.gz">a</a>'
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    wire = Wire(monkeypatch, answer)
+
+    assert _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+
+    assert (tmp_path / "table.csv.gz").read_bytes() == b"csv-bytes"
+    assert all("Authorization" not in request.headers for request in wire.sent)
+
+
 # ------------------------------------------------------------
 # CSV -> Parquet conversion and DuckDB init tests
 # ------------------------------------------------------------
@@ -144,6 +455,252 @@ def test_convert_csv_to_parquet_and_init_duckdb(tmp_path, monkeypatch):
     finally:
         con.close()
     assert cnt == 2
+
+
+def test_failed_conversion_leaves_no_table_and_a_second_run_finishes_it(tmp_path):
+    src_root = tmp_path / "src"
+    (src_root / "hosp").mkdir(parents=True)
+    _write_gz_csv(src_root / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    broken = src_root / "hosp" / "patients.csv.gz"
+    broken.write_bytes(b"this is not gzip")
+    dst_root = tmp_path / "parquet"
+
+    assert not convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+
+    # The table that failed is not there in any form, and the folder says so.
+    assert sorted(p.name for p in dst_root.rglob("*") if p.is_file()) == [
+        ".m4-converting.json",
+        "admissions.parquet",
+    ]
+    assert unfinished_conversion(dst_root) == (
+        str(src_root.resolve()),
+        ["hosp/patients.parquet"],
+    )
+    assert find_unconverted(src_root, dst_root) == [broken]
+
+    _write_gz_csv(broken, "subject_id,gender\n1,F\n")
+
+    assert convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+    assert find_unconverted(src_root, dst_root) == []
+    assert unfinished_conversion(dst_root) is None
+    assert sorted(p.name for p in dst_root.rglob("*") if p.is_file()) == [
+        "admissions.parquet",
+        "patients.parquet",
+    ]
+
+
+def test_prepared_mark_is_for_one_database_over_one_parquet_folder(tmp_path):
+    parquet_root = tmp_path / "old" / "parquet"
+    _create_parquet(parquet_root / "hosp", "admissions", "subject_id\n1\n")
+    db_path = tmp_path / "old" / "mimic.duckdb"
+    db_path.touch()
+
+    assert not is_dataset_prepared(parquet_root, db_path)
+    mark_dataset_prepared(parquet_root, db_path)
+    assert is_dataset_prepared(parquet_root, db_path)
+
+    # Another database over the same files was not initialized by that run.
+    assert not is_dataset_prepared(parquet_root, tmp_path / "old" / "other.duckdb")
+
+    # Views name their Parquet files by absolute path, so a data directory
+    # that was moved needs `m4 init` again.
+    (tmp_path / "old").rename(tmp_path / "new")
+    assert not is_dataset_prepared(
+        tmp_path / "new" / "parquet", tmp_path / "new" / "mimic.duckdb"
+    )
+
+
+def test_prepared_mark_does_not_hold_for_a_table_replaced_under_its_name(tmp_path):
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root / "hosp", "admissions", "subject_id\n1\n")
+    db_path = tmp_path / "mimic.duckdb"
+    db_path.touch()
+    mark_dataset_prepared(parquet_root, db_path)
+
+    # Another file under the same name, as a copy cut short or one put there by hand.
+    table = parquet_root / "hosp" / "admissions.parquet"
+    table.write_bytes(table.read_bytes()[: table.stat().st_size // 2])
+
+    assert not is_dataset_prepared(parquet_root, db_path)
+
+
+def test_initializing_again_drops_the_view_of_a_table_that_is_gone(tmp_path):
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root / "hosp", "admissions", "subject_id\n1\n")
+    _create_parquet(parquet_root / "icu", "icustays", "subject_id\n1\n")
+    db_path = tmp_path / "test.duckdb"
+    mapping = {"hosp": "mimiciv_hosp", "icu": "mimiciv_icu"}
+    assert _create_duckdb_with_views(db_path, parquet_root, schema_mapping=mapping)
+    con = duckdb.connect(str(db_path))
+    try:
+        # A view of the user's own, over a file outside the dataset, is not M4's.
+        con.execute("CREATE VIEW main.mine AS SELECT 1 AS one")
+    finally:
+        con.close()
+
+    (parquet_root / "icu" / "icustays.parquet").unlink()
+    assert _create_duckdb_with_views(db_path, parquet_root, schema_mapping=mapping)
+
+    con = duckdb.connect(str(db_path))
+    try:
+        views = {
+            f"{schema}.{name}"
+            for schema, name in con.execute(
+                "SELECT schema_name, view_name FROM duckdb_views() WHERE NOT internal"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert views == {"mimiciv_hosp.admissions", "main.mine"}
+
+
+MIMIC_IV_MAPPING = {
+    "hosp": "mimiciv_hosp",
+    "icu": "mimiciv_icu",
+    "derived": "mimiciv_derived",
+}
+
+
+def _touch_raw(root, *names):
+    for name in names:
+        path = root / f"{name}.csv.gz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    return root
+
+
+def test_find_raw_root_accepts_the_folder_the_dataset_is_laid_out_in(tmp_path):
+    root = _touch_raw(tmp_path, "hosp/admissions", "icu/icustays")
+
+    assert find_raw_root(root, MIMIC_IV_MAPPING) == root
+
+
+def test_find_raw_root_finds_the_version_folder_below_a_wget_tree(tmp_path):
+    version = _touch_raw(
+        tmp_path / "physionet.org" / "files" / "mimiciv" / "3.1",
+        "hosp/admissions",
+        "icu/icustays",
+    )
+
+    assert find_raw_root(tmp_path, MIMIC_IV_MAPPING) == version
+    assert find_raw_root(tmp_path / "physionet.org", MIMIC_IV_MAPPING) == version
+
+
+def test_find_raw_root_for_files_that_belong_at_the_top_level(tmp_path):
+    # eICU keeps every table directly in its folder.
+    version = _touch_raw(tmp_path / "files" / "eicu-crd" / "2.0", "patient", "lab")
+
+    assert find_raw_root(tmp_path, {"": "eicu_crd"}) == version
+    assert find_raw_root(version, {"": "eicu_crd"}) == version
+
+
+def test_find_raw_root_prefers_the_folder_above_a_single_schema_folder(tmp_path):
+    # mimic-iv-note is accepted both as note/*.csv.gz and as bare files.
+    version = _touch_raw(tmp_path / "files" / "mimic-iv-note" / "2.2", "note/discharge")
+
+    assert find_raw_root(tmp_path, {"note": "mimiciv_note"}) == version
+    assert find_raw_root(version / "note", {"note": "mimiciv_note"}) == version / "note"
+
+
+def test_find_raw_root_without_a_fitting_folder(tmp_path):
+    root = _touch_raw(tmp_path, "admissions", "other/icustays")
+
+    assert find_raw_root(root, MIMIC_IV_MAPPING) is None
+
+
+def test_find_raw_root_without_a_schema_mapping_takes_any_layout(tmp_path):
+    root = _touch_raw(tmp_path, "anything/goes/table")
+
+    assert find_raw_root(root, None) == root
+
+
+def test_raw_files_left_to_convert_are_those_without_a_finished_table(tmp_path):
+    raw_root = _touch_raw(tmp_path / "raw", "hosp/admissions", "icu/icustays")
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root / "hosp", "admissions", "subject_id\n1\n")
+    waiting = [raw_root / "icu" / "icustays.csv.gz"]
+
+    assert (
+        raw_files_left_to_convert(raw_root, parquet_root, MIMIC_IV_MAPPING) == waiting
+    )
+
+    table = _create_parquet(parquet_root / "icu", "icustays", "subject_id\n1\n")
+    assert raw_files_left_to_convert(raw_root, parquet_root, MIMIC_IV_MAPPING) == []
+
+    # A table that was cut short is no table.
+    table.write_bytes(table.read_bytes()[:40])
+    assert (
+        raw_files_left_to_convert(raw_root, parquet_root, MIMIC_IV_MAPPING) == waiting
+    )
+
+
+def test_raw_files_left_to_convert_are_looked_for_where_init_reads_them(tmp_path):
+    # A wget tree in M4's raw folder: init names the folder deeper down, and
+    # converts from there.
+    raw_root = tmp_path / "raw"
+    nested = _touch_raw(
+        raw_root / "physionet.org" / "files" / "mimiciv" / "3.1", "hosp/admissions"
+    )
+    parquet_root = tmp_path / "parquet"
+
+    assert raw_files_left_to_convert(raw_root, parquet_root, MIMIC_IV_MAPPING) == [
+        nested / "hosp" / "admissions.csv.gz"
+    ]
+
+    _create_parquet(parquet_root / "hosp", "admissions", "subject_id\n1\n")
+    assert raw_files_left_to_convert(raw_root, parquet_root, MIMIC_IV_MAPPING) == []
+
+    # Files that init cannot place are not waited for: no run converts them.
+    unplaced = _touch_raw(tmp_path / "unplaced", "admissions", "other/icustays")
+    assert raw_files_left_to_convert(unplaced, parquet_root, MIMIC_IV_MAPPING) == []
+    # Neither is a folder that is not there, with or without a mapping.
+    missing = tmp_path / "missing"
+    assert raw_files_left_to_convert(missing, parquet_root, MIMIC_IV_MAPPING) == []
+    assert raw_files_left_to_convert(missing, parquet_root, None) == []
+
+
+def test_folders_without_tables_counts_raw_files_and_tables_alike(tmp_path):
+    raw_root = _touch_raw(tmp_path / "raw", "hosp/admissions")
+    parquet_root = tmp_path / "parquet"
+    folders = ["hosp", "icu"]
+
+    assert folders_without_tables(
+        folders, MIMIC_IV_MAPPING, raw_root, parquet_root
+    ) == ["icu"]
+
+    # Tables from an earlier run fill a folder as raw files do.
+    _create_parquet(parquet_root / "icu", "icustays", "subject_id\n1\n")
+    assert (
+        folders_without_tables(folders, MIMIC_IV_MAPPING, raw_root, parquet_root) == []
+    )
+
+    # Bare files fill the one folder of a dataset of one schema.
+    note_mapping = {"note": "mimiciv_note"}
+    bare = _touch_raw(tmp_path / "bare", "discharge")
+    nothing = tmp_path / "nothing"
+    assert folders_without_tables(["note"], note_mapping, bare, nothing) == []
+    assert folders_without_tables(["note"], note_mapping, nothing, nothing) == ["note"]
+
+    # A dataset without a mapping has no folders to fill.
+    assert folders_without_tables(folders, None, raw_root, nothing) == []
+    assert folders_without_tables(folders, {}, raw_root, nothing) == []
+
+
+def test_no_view_created_is_a_failure(tmp_path):
+    """Parquet files that all sit outside the mapped folders give an empty
+    database, which must not pass for an initialized one."""
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(
+        parquet_root / "files" / "mimiciv" / "3.1" / "hosp",
+        "admissions",
+        "subject_id,hadm_id\n1,100\n",
+    )
+
+    ok = _create_duckdb_with_views(
+        tmp_path / "test.duckdb", parquet_root, schema_mapping=MIMIC_IV_MAPPING
+    )
+
+    assert not ok
 
 
 # ------------------------------------------------------------
@@ -348,3 +905,458 @@ def test_roundtrip_parquet_to_backend_api(tmp_path):
     assert sample.success is True
     assert sample.row_count <= 1
     assert "subject_id" in sample.dataframe.columns
+
+
+def test_unfinished_conversion_is_not_settled_by_converting_another_folder(tmp_path):
+    first = tmp_path / "first"
+    (first / "hosp").mkdir(parents=True)
+    _write_gz_csv(first / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    broken = first / "hosp" / "patients.csv.gz"
+    broken.write_bytes(b"this is not gzip")
+    dst_root = tmp_path / "parquet"
+    assert not convert_csv_to_parquet("mimic-iv-demo", first, dst_root)
+
+    # A folder without the raw file of the table that failed converts what it
+    # holds, and leaves the first conversion as unfinished as it was.
+    second = tmp_path / "second"
+    (second / "hosp").mkdir(parents=True)
+    _write_gz_csv(second / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    _write_gz_csv(second / "hosp" / "transfers.csv.gz", "subject_id\n1\n")
+
+    assert convert_csv_to_parquet("mimic-iv-demo", second, dst_root)
+    assert (dst_root / "hosp" / "transfers.parquet").exists()
+    assert unfinished_conversion(dst_root) == (
+        str(first.resolve()),
+        ["hosp/patients.parquet"],
+    )
+
+    _write_gz_csv(broken, "subject_id,gender\n1,F\n")
+
+    assert convert_csv_to_parquet("mimic-iv-demo", first, dst_root)
+    assert unfinished_conversion(dst_root) is None
+    assert not (dst_root / ".m4-converting.json").exists()
+
+
+def test_failed_conversion_is_finished_from_its_own_folder_without_the_bad_file(
+    tmp_path,
+):
+    src_root = tmp_path / "src"
+    (src_root / "hosp").mkdir(parents=True)
+    _write_gz_csv(src_root / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    # What macOS leaves beside a file on a drive that cannot keep its attributes.
+    junk = src_root / "hosp" / "._admissions.csv.gz"
+    junk.write_bytes(b"\x00\x05\x16\x07 not a table")
+    dst_root = tmp_path / "parquet"
+
+    assert not convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+    assert unfinished_conversion(dst_root) is not None
+
+    # Another folder would have to bring the table that failed. The folder
+    # the conversion read from finishes it with whatever it holds by then.
+    other = _touch_raw(tmp_path / "other", "hosp/admissions")
+    assert conversion_out_of_reach(dst_root, other) == str(src_root.resolve())
+    assert conversion_out_of_reach(dst_root, src_root) is None
+
+    junk.unlink()
+
+    assert conversion_out_of_reach(dst_root, src_root) is None
+    assert convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+    assert unfinished_conversion(dst_root) is None
+    assert sorted(p.name for p in dst_root.rglob("*") if p.is_file()) == [
+        "admissions.parquet"
+    ]
+
+
+def test_conversion_note_without_its_tables_is_only_settled_from_its_own_folder(
+    tmp_path,
+):
+    # For a short time M4 noted the folder an unfinished conversion read from,
+    # and not the tables it was to make. Which of them are missing is then
+    # unknown, so no other folder can be taken to finish it.
+    first = tmp_path / "first"
+    (first / "hosp").mkdir(parents=True)
+    _write_gz_csv(first / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    _write_gz_csv(first / "hosp" / "patients.csv.gz", "subject_id,gender\n1,F\n")
+    second = tmp_path / "second"
+    (second / "hosp").mkdir(parents=True)
+    _write_gz_csv(second / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    dst_root = tmp_path / "parquet"
+    dst_root.mkdir()
+    note = dst_root / ".m4-converting.json"
+    note.write_text(json.dumps({"version": 1, "source": str(first.resolve())}))
+
+    assert convert_csv_to_parquet("mimic-iv-demo", second, dst_root)
+    assert convert_csv_to_parquet("mimic-iv-demo", second, dst_root)
+    assert unfinished_conversion(dst_root) == (str(first.resolve()), None)
+
+    assert convert_csv_to_parquet("mimic-iv-demo", first, dst_root)
+    assert unfinished_conversion(dst_root) is None
+    assert not note.exists()
+
+
+def test_find_raw_root_next_to_another_dataset_goes_by_the_folder_name(tmp_path):
+    # One wget tree with MIMIC-IV and its notes. Bare files pass for a dataset
+    # of one schema, so hosp/ and icu/ would fit the notes as well, and hold
+    # more files than note/ does.
+    tree = tmp_path / "physionet.org" / "files"
+    _touch_raw(
+        tree / "mimiciv" / "3.1",
+        "hosp/admissions",
+        "hosp/patients",
+        "hosp/labevents",
+        "icu/icustays",
+        "icu/chartevents",
+    )
+    notes = _touch_raw(
+        tree / "mimic-iv-note" / "2.2", "note/discharge", "note/radiology"
+    )
+
+    assert find_raw_root(tmp_path, {"note": "mimiciv_note"}) == notes
+    assert find_raw_root(tree, MIMIC_IV_MAPPING) == tree / "mimiciv" / "3.1"
+
+
+def test_find_raw_root_names_no_folder_when_several_fit(tmp_path):
+    # eICU keeps its tables directly in its folder, and so does every folder
+    # of another dataset next to it. The full dataset and its demo are laid
+    # out alike. M4 cannot tell which one is meant, and a wrong guess puts
+    # one dataset's tables into another.
+    tree = tmp_path / "physionet.org" / "files"
+    _touch_raw(
+        tree / "mimiciv" / "3.1",
+        "hosp/admissions",
+        "hosp/patients",
+        "hosp/labevents",
+        "icu/icustays",
+    )
+    _touch_raw(tree / "mimic-iv-demo" / "2.2", "hosp/admissions", "icu/icustays")
+    _touch_raw(tree / "eicu-crd" / "2.0", "patient", "lab")
+
+    assert find_raw_root(tmp_path, {"": "eicu_crd"}) is None
+    assert find_raw_root(tmp_path, MIMIC_IV_MAPPING) is None
+    # The folder that was asked about is taken when it fits itself.
+    eicu = tree / "eicu-crd" / "2.0"
+    assert find_raw_root(eicu, {"": "eicu_crd"}) == eicu
+
+
+def test_table_is_not_published_from_what_another_run_is_still_writing(
+    tmp_path, monkeypatch
+):
+    """Two runs converting the same table must not share its temporary file:
+    the first to finish would publish what the other has written so far."""
+    src_root = tmp_path / "src"
+    (src_root / "hosp").mkdir(parents=True)
+    _write_gz_csv(src_root / "hosp" / "admissions.csv.gz", "subject_id\n1\n2\n")
+    dst_root = tmp_path / "parquet"
+    table = dst_root / "hosp" / "admissions.parquet"
+
+    class Died(BaseException):
+        """The other run was killed in the middle of the table."""
+
+    class OtherRunWritingHalfATable:
+        def execute(self, sql):
+            target = re.search(r"TO '([^']+)'", sql)
+            if target:
+                Path(target.group(1)).write_bytes(b"PAR1 and half a table")
+                raise Died()
+
+        def close(self):
+            pass
+
+    real_replace = os.replace
+    other_run_started = []
+
+    def replace(src, dst):
+        # This run is about to publish the table. Right now another run
+        # starts on the same table, and gets halfway.
+        if Path(dst) == table and not other_run_started:
+            other_run_started.append(True)
+            with monkeypatch.context() as other, pytest.raises(Died):
+                other.setattr(
+                    "m4.data_io.duckdb.connect", lambda: OtherRunWritingHalfATable()
+                )
+                # The other run is another process, with a terminal of its own.
+                other.setattr(
+                    "m4.data_io.create_task_progress",
+                    lambda: Progress(console=Console(file=io.StringIO())),
+                )
+                convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("m4.data_io.os.replace", replace)
+
+    published = convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+
+    # The other run cleared what it found of the table, this run's file
+    # included. So this run fails, and no half-written file passes for a table.
+    assert other_run_started
+    assert published is False
+    assert not table.exists()
+
+    monkeypatch.setattr("m4.data_io.os.replace", real_replace)
+    assert convert_csv_to_parquet("mimic-iv-demo", src_root, dst_root)
+    assert find_unconverted(src_root, dst_root) == []
+    assert sorted(p.name for p in dst_root.rglob("*") if p.is_file()) == [
+        "admissions.parquet"
+    ]
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{table.as_posix()}')"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert rows == 2
+
+
+# ------------------------------------------------------------
+# A download says of itself whether it finished
+# ------------------------------------------------------------
+
+DOWNLOAD_NOTE = ".m4-downloading.json"
+
+
+def test_download_is_noted_as_unfinished_until_every_file_arrived(
+    tmp_path, monkeypatch
+):
+    listing = "https://example.test/open-data/"
+    out_of_reach = {"second.csv.gz"}
+
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="first.csv.gz">a</a><a href="second.csv.gz">b</a>'
+        if request.url.rsplit("/", 1)[1] in out_of_reach:
+            return 503, {}, b""
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    Wire(monkeypatch, answer)
+
+    with pytest.raises(DatasetDownloadError) as failed:
+        _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+
+    # One file is there, and nothing but the note says that one is missing.
+    assert failed.value.code == "download_network_failed"
+    assert (tmp_path / "first.csv.gz").read_bytes() == b"csv-bytes"
+    assert (tmp_path / DOWNLOAD_NOTE).exists()
+
+    out_of_reach.clear()
+
+    assert _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "first.csv.gz",
+        "second.csv.gz",
+    ]
+
+
+def test_download_into_a_folder_that_cannot_be_noted_fetches_nothing(
+    tmp_path, monkeypatch
+):
+    listing = "https://example.test/open-data/"
+
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="table.csv.gz">a</a>'
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    wire = Wire(monkeypatch, answer)
+    real_write_text = Path.write_text
+
+    def write_text(self, *args, **kwargs):
+        if self.name.startswith(DOWNLOAD_NOTE):
+            raise OSError(28, "No space left on device", str(self))
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+    with pytest.raises(DatasetDownloadError) as failed:
+        _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+
+    # Without the note, files that arrive could pass for a whole download.
+    assert failed.value.code == "download_filesystem_failed"
+    assert [request.method for request in wire.sent] == ["GET", "HEAD"]
+    assert not list(tmp_path.rglob("*.csv.gz*"))
+
+
+def test_download_that_gets_no_listing_leaves_no_note(tmp_path, monkeypatch):
+    listing = "https://physionet.org/files/made-up/1.0/"
+    Wire(monkeypatch, lambda request: (401, {}, b""))
+
+    with pytest.raises(DatasetDownloadError) as refused:
+        _download_dataset_files(
+            "made-up", {"file_listing_url": listing}, tmp_path, credentials=FAKE_LOGIN
+        )
+
+    # Nothing was downloaded, so there is nothing to finish.
+    assert refused.value.code == "physionet_auth_failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_that_finds_every_file_complete_writes_nothing(tmp_path, monkeypatch):
+    listing = "https://example.test/open-data/"
+
+    def answer(request):
+        if request.url == listing:
+            return 200, {}, b'<a href="table.csv.gz">a</a>'
+        if request.method == "HEAD":
+            return 200, {"content-length": "9"}, b""
+        return 200, {"content-length": "9"}, b"csv-bytes"
+
+    wire = Wire(monkeypatch, answer)
+    assert _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+    wire.sent.clear()
+
+    # Going over a whole download again must work in a folder that cannot be
+    # written to, and being killed while doing so must leave no note.
+    def no_writing(*args, **kwargs):
+        raise AssertionError("Nothing is to be written.")
+
+    def read_only(self, *args, **kwargs):
+        # What a read-only mount answers, whether or not the file is there.
+        raise OSError(errno.EROFS, "Read-only file system", str(self))
+
+    monkeypatch.setattr("m4.data_io._write_marker", no_writing)
+    monkeypatch.setattr(Path, "unlink", read_only)
+
+    assert _download_dataset_files("open", {"file_listing_url": listing}, tmp_path)
+    assert [request.method for request in wire.sent] == ["GET", "HEAD"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["table.csv.gz"]
+
+
+# ------------------------------------------------------------
+# Table names and imaging datasets
+# ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "table"),
+    [
+        ("admissions", "admissions"),
+        ("ADMISSIONS", "admissions"),
+        ("mimic-cxr-2.0.0-chexpert", "mimic_cxr_2_0_0_chexpert"),
+        ("lab results", "lab_results"),
+        ("2020_labs", "_2020_labs"),
+        ("Données", "données"),  # DuckDB takes letters beyond ASCII unquoted
+    ],
+)
+def test_sql_table_name(name, table):
+    assert sql_table_name(name) == table
+
+
+def test_schema_mapped_files_with_dashes_and_dots_become_tables(tmp_path):
+    """As MIMIC-CXR-JPG's mimic-cxr-2.0.0-chexpert.csv.gz did not, before."""
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root, "mimic-cxr-2.0.0-chexpert", "study_id\n1\n2\n")
+
+    db_path = tmp_path / "test.duckdb"
+    assert _create_duckdb_with_views(db_path, parquet_root, {"": "mimic_cxr"})
+
+    con = duckdb.connect(str(db_path))
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM mimic_cxr.mimic_cxr_2_0_0_chexpert"
+        ).fetchone()
+        assert count == (2,)
+    finally:
+        con.close()
+
+
+def test_table_names_rename_tables_and_images_view_holds_each_path(tmp_path):
+    cxr = DatasetRegistry.get("mimic-cxr-jpg")
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(
+        parquet_root,
+        "mimic-cxr-2.0.0-metadata",
+        "dicom_id,subject_id,study_id,ViewPosition\n"
+        "02aa804e-bde0afdd,10000032,50414267,PA\n"
+        "174413ec-4ec4c1f7,10000764,57375967,AP\n",
+    )
+    _create_parquet(
+        parquet_root, "mimic-cxr-2.1.0-test-set-labeled", "study_id,Edema\n1,1.0\n"
+    )
+
+    db_path = tmp_path / "test.duckdb"
+    assert _create_duckdb_with_views(
+        db_path,
+        parquet_root,
+        cxr.schema_mapping,
+        table_names=cxr.table_names,
+        images=cxr.images,
+    )
+
+    con = duckdb.connect(str(db_path))
+    try:
+        views = {
+            row[0]
+            for row in con.execute(
+                "SELECT table_schema || '.' || table_name FROM information_schema.tables"
+            ).fetchall()
+        }
+        assert views == {
+            "mimic_cxr.metadata",
+            "mimic_cxr.test_labels",
+            "mimic_cxr.images",
+        }
+        rows = con.execute(
+            "SELECT dicom_id, ViewPosition, image_path FROM mimic_cxr.images "
+            "ORDER BY dicom_id"
+        ).fetchall()
+        assert rows == [
+            (
+                "02aa804e-bde0afdd",
+                "PA",
+                "files/p10/p10000032/s50414267/02aa804e-bde0afdd.jpg",
+            ),
+            (
+                "174413ec-4ec4c1f7",
+                "AP",
+                "files/p10/p10000764/s57375967/174413ec-4ec4c1f7.jpg",
+            ),
+        ]
+    finally:
+        con.close()
+
+
+def test_an_images_view_cannot_replace_a_table(tmp_path):
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root, "images", "scan_id\n1\n")
+    images = ImageFiles(
+        table="s.images",
+        view="s.images",
+        id_column="scan_id",
+        path_template="{scan_id}.png",
+    )
+
+    with pytest.raises(ValueError, match=r"would replace the table of images\.parquet"):
+        _create_duckdb_with_views(
+            tmp_path / "test.duckdb", parquet_root, {"": "s"}, images=images
+        )
+
+
+def test_files_that_would_make_one_table_are_refused(tmp_path):
+    parquet_root = tmp_path / "parquet"
+    _create_parquet(parquet_root, "lab-results", "x\n1\n")
+    _create_parquet(parquet_root, "lab_results", "x\n2\n")
+
+    with pytest.raises(ValueError, match="would both become the table"):
+        _create_duckdb_with_views(tmp_path / "test.duckdb", parquet_root, {"": "s"})
+
+
+def test_scrape_takes_plain_csv_files_but_not_the_image_folders(monkeypatch):
+    html = (
+        '<a href="files/">files/</a>'
+        '<a href="IMAGE_FILENAMES">IMAGE_FILENAMES</a>'
+        '<a href="mimic-cxr-2.0.0-metadata.csv.gz">metadata</a>'
+        '<a href="mimic-cxr-2.1.0-test-set-labeled.csv">test labels</a>'
+    )
+    session = requests.Session()
+    monkeypatch.setattr(session, "get", lambda url, timeout=None: DummyResponse(html))
+
+    urls = _scrape_urls_from_html_page("https://physionet.org/x/", session)
+
+    assert urls == [
+        "https://physionet.org/x/mimic-cxr-2.0.0-metadata.csv.gz",
+        "https://physionet.org/x/mimic-cxr-2.1.0-test-set-labeled.csv",
+    ]

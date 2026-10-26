@@ -2,6 +2,10 @@
 
 Use Google Cloud BigQuery to access full clinical datasets without downloading files locally.
 
+For local DuckDB workflows, use `m4 download DATASET` followed by
+`m4 init DATASET`. For BigQuery workflows, skip local download entirely and
+configure credentials/project billing as described below.
+
 ## Prerequisites
 
 1. **Google Cloud account** with BigQuery access
@@ -38,10 +42,17 @@ m4 config --backend bigquery --project-id YOUR_PROJECT_ID
 
 Replace `YOUR_PROJECT_ID` with your own billing project for BigQuery usage, not the PhysioNet dataset project. The variable is mandatory to ensure billing is correctly attributed.
 
-### 4. Set the dataset
+You can also emit agent-ready environment guidance without changing config:
 
 ```bash
-m4 use mimic-iv    # or eicu
+m4 setup-agent --backend bigquery --project-id YOUR_PROJECT_ID --format dotenv
+m4 doctor --json
+```
+
+### 4. Query with an explicit dataset
+
+```bash
+m4 status --dataset mimic-iv --backend bigquery
 ```
 
 ### 5. Restart your MCP client
@@ -56,12 +67,20 @@ M4 uses these PhysioNet BigQuery datasets:
 |---------|-----------------|-------------|
 | mimic-iv | `physionet-data` | `mimiciv_3_1_hosp`, `mimiciv_3_1_icu` |
 | mimic-iv-note | `physionet-data` | `mimiciv_note` |
+| mimic-iv-ed-demo | `physionet-demo` | `mimiciv_ed` |
 | mimic-iv-ed | `physionet-data` | `mimiciv_ed` |
+| eicu-demo | `physionet-data` | `eicu_crd_demo` |
 | eicu | `physionet-data` | `eicu_crd` |
+| mimic-iii | `physionet-data` | `mimiciii_clinical` |
+
+The demos keep the canonical schema of their full dataset: `eicu_crd.patient`
+on `eicu-demo` reads `physionet-data.eicu_crd_demo.patient`. PhysioNet keeps
+the MIMIC-III notes in a separate `mimiciii_notes` dataset on BigQuery, which
+M4 does not query; in a local database they are `mimiciii_clinical.noteevents`.
 
 ## Derived Tables on BigQuery
 
-BigQuery users already have access to ~63 pre-computed derived concept tables (SOFA scores, sepsis cohorts, KDIGO AKI staging, medications, etc.) via `physionet-data.mimiciv_derived`. These tables are maintained by PhysioNet and are the same concepts that local DuckDB users materialize with `m4 init-derived mimic-iv`.
+BigQuery users already have access to pre-computed derived concept tables (SOFA scores, sepsis cohorts, KDIGO AKI staging, medications, etc.) via `physionet-data.mimiciv_derived`. These tables are maintained by PhysioNet and are the same concepts that local DuckDB users materialize with `m4 init-derived mimic-iv`.
 
 You do **not** need to run `m4 init-derived` when using BigQuery -- the tables are already available. Query them directly:
 
@@ -73,7 +92,8 @@ The `mimiciv_derived` schema is accessible alongside the standard `mimiciv_hosp`
 
 ## Environment Variables
 
-You can also override the backend via environment variables (these take priority over `m4 backend`):
+You can also override the backend and project via environment variables. These
+take priority over saved CLI configuration for the current process:
 
 ```bash
 export M4_BACKEND=bigquery
@@ -98,7 +118,15 @@ BigQuery charges based on data scanned. Tips to minimize costs:
 **"Project not found" error:**
 - Check the project ID is correct
 - Ensure BigQuery API is enabled in your project
+- Confirm `M4_PROJECT_ID` or `m4 config --project-id` refers to your billing project
 
 **Slow queries:**
 - BigQuery has network latency; consider local DuckDB for development
 - Use smaller `LIMIT` values while exploring
+
+**Local download layout problems:**
+- Run `m4 download mimic-iv` or `m4 download eicu` to print dataset-specific
+  recovery guidance and a resumable `wget` command.
+- If files landed under `physionet.org/files/...`, move the dataset contents up
+  to `m4_data/raw_files/DATASET` or rerun `wget` with the generated
+  `--cut-dirs` and `-nH` flags.
